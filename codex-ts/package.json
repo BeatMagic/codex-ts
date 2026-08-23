@@ -1,8 +1,16 @@
 {
-  "name": "@ai0x0/codex-ts",
-  "version": "0.7.0",
+  "name": "@beatmagic/codex-ts",
+  "version": "0.7.1",
   "type": "module",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BeatMagic/codex-ts.git",
+    "directory": "codex-ts"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
   "exports": {
     ".": {
       "import": "./dist/core/src/index.js",
