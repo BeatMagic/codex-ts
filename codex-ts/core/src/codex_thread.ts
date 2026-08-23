@@ -272,6 +272,22 @@ export class CodexThread {
   get id(): string { return this.threadId; }
 
   /**
+   * Is a turn still parked inside `request_user_input` waiting for THIS answer?
+   *
+   * `submit({ type: "UserInputAnswer" })` is a silent no-op when the resolver is
+   * gone (see the UserInputAnswer arm below) — and the resolver is gone after
+   * every page reload, because `pendingInputs` is process memory while the
+   * `function_call` it belongs to is already on disk. Without this predicate a
+   * host cannot tell "answer delivered" from "answer dropped on the floor": it
+   * reports success, flips to a spinner and hangs forever (2026-08-07 field
+   * report). Exposing it lets the host refuse honestly and rebuild the card
+   * instead.
+   */
+  hasPendingInput(turnId: string): boolean {
+    return this.pendingInputs.has(turnId);
+  }
+
+  /**
    * Async factory — use this instead of `new` when resuming an existing thread.
    *
    * If `config.threadId` is supplied and the backing store contains history,

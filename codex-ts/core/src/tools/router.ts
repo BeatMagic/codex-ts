@@ -185,7 +185,33 @@ export class ToolRouter {
             emitEvent: ctx.emitEvent,
           });
         }
-        return JSON.stringify({ error: `Unknown tool: ${toolName}` });
+        // A bare `{error: "Unknown tool: <name>"}` returns the one fact the
+        // model already had, and leaves the failure ambiguous between the only
+        // two causes: "I wrote the wrong name" and "this session has no such
+        // capability". Models reliably pick the second, and the second is
+        // catastrophic. Observed 2026-08-19 in two production sessions, both at
+        // the same workflow step, both calling a tool from the model's own
+        // harness that was never registered here: one then told the user that
+        // the documents it had really generated "were made up with no real tool
+        // behind them", while the rendered output sat in the project library.
+        // Both recovered the instant the user said "try again" — the whole
+        // incident was one unrecognised name plus an error that could not
+        // disambiguate.
+        //
+        // So the error carries the roster and names the likelier cause. The
+        // roster is exactly what toolSpecs() advertises, which makes an absent
+        // name provable rather than a guess.
+        return JSON.stringify({
+          error: `Unknown tool: ${toolName}`,
+          known_tools: this.toolSpecs().map((spec) => spec.tool.name),
+          hint:
+            `"${toolName}" is not one of this session's tools. known_tools is the ` +
+            `complete list and every name on it works. This is a WRONG NAME, not a ` +
+            `missing capability: take the closest name from known_tools and re-send ` +
+            `the same call. Do not conclude from this error that a tool, a skill or ` +
+            `a capability is unavailable, and do not revise or disown anything you ` +
+            `already accomplished through the tools that ARE listed.`,
+        });
       }
     }
   }

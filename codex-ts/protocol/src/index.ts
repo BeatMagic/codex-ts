@@ -8,7 +8,12 @@ export type {
   RequestUserInputEvent,
 } from "./request_user_input.js";
 export type { StepStatus, PlanItemArg, UpdatePlanArgs } from "./plan_tool.js";
-export type { ContextCompactedEvent, WarningEvent } from "./protocol.js";
+export type {
+  ContextCompactedEvent,
+  FunctionCallStreamArgsEvent,
+  FunctionCallStreamStartEvent,
+  WarningEvent,
+} from "./protocol.js";
 export {
   MAX_THREAD_GOAL_OBJECTIVE_CHARS,
   validateThreadGoalObjective,

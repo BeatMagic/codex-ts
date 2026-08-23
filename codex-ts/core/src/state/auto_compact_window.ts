@@ -55,6 +55,11 @@ export class AutoCompactWindow {
   private prefillSource: "server" | "estimated" | null = null;
   private tokenBudgetReminderDelivered = false;
   private autoCompactFallbackDelivered = false;
+  /**
+   * Generation counter for landed compactions. No equivalent in codex-rs, whose
+   * compaction is not concurrent with itself; see `currentCompactionEpoch`.
+   */
+  private compactionEpoch = 0;
 
   clearPrefill(): void {
     this.prefillInputTokens = null;
@@ -162,6 +167,35 @@ export class AutoCompactWindow {
 
   snapshot(): AutoCompactWindowSnapshot {
     return { prefillInputTokens: this.prefillInputTokens };
+  }
+
+  /**
+   * How many compactions have LANDED on this thread.
+   *
+   * No equivalent in codex-rs: there, a compaction cannot overlap another one.
+   * codex-ts runs turns concurrently (`void runTurn` in codex_thread.ts) over a
+   * single shared history, and its summarizer request is not abortable, so two
+   * compactions being in flight at once is reachable from several directions.
+   *
+   * A compaction is a decision made on a reading of history + token state. If
+   * another one lands while this summarizer is in flight, that reading is void:
+   * applying the late summary would rewrite a history that has already been
+   * replaced, discarding everything produced in between (assistant messages and
+   * tool calls are not user messages, so collectUserMessages cannot recover
+   * them). Comparing the epoch at entry against the epoch at the moment of
+   * mutation makes the late compaction a no-op instead of a rewrite.
+   *
+   * Observed without it (2026-08-17): three ContextCompacted for one legitimate
+   * trigger, the last two at 34k/600k where neither trigger line is near.
+   */
+  currentCompactionEpoch(): number {
+    return this.compactionEpoch;
+  }
+
+  /** Mark a compaction as landed, making every in-flight one stale. */
+  bumpCompactionEpoch(): number {
+    this.compactionEpoch += 1;
+    return this.compactionEpoch;
   }
 
   /**
