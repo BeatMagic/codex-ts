@@ -221,6 +221,33 @@ export interface TokenCountEvent {
   rate_limits: null;
 }
 
+// ─── Function-call composition (browser-specific) ─────────────────────────────
+//
+// No equivalent in codex-rs/protocol: a native TUI renders the tool call from
+// `response.output_item.done`, which arrives only once the model has finished
+// writing the arguments. In a browser host that gap is visible — a long
+// `doc.create` spends seconds as blank "Loading" while the model composes it.
+//
+// These two events mirror the wire as it streams so a host can show the tool
+// name immediately and the arguments as they arrive. They are DISPLAY-ONLY by
+// construction: nothing derived from them feeds the dispatched call, whose
+// arguments still come solely from `response.output_item.done`.
+
+/** A function call has started streaming; its name is known, arguments are not. */
+export interface FunctionCallStreamStartEvent {
+  turn_id: string;
+  /** The streaming item's id — matches the `id` on FunctionCallStreamArgs. */
+  id: string;
+  name: string;
+}
+
+/** One raw `arguments` delta for a function call that is still streaming. */
+export interface FunctionCallStreamArgsEvent {
+  turn_id: string;
+  id: string;
+  delta: string;
+}
+
 export type EventMsg =
   | { type: "TurnStarted"; event: TurnStartedEvent }
   | { type: "TurnComplete"; event: TurnCompleteEvent }
@@ -240,6 +267,10 @@ export type EventMsg =
   | { type: "TokenCount"; event: TokenCountEvent }
   /** mirrors EventMsg::Warning — post-compaction advisory */
   | { type: "Warning"; event: WarningEvent }
+  /** Browser-specific: a function call began streaming (display only). */
+  | { type: "FunctionCallStreamStart"; event: FunctionCallStreamStartEvent }
+  /** Browser-specific: one `arguments` delta of a streaming call (display only). */
+  | { type: "FunctionCallStreamArgs"; event: FunctionCallStreamArgsEvent }
   | { type: "Error"; event: ErrorEvent };
 
 /** Wraps EventMsg with the submission_id that originated it — mirrors codex-rs Event */

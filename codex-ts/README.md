@@ -1,11 +1,11 @@
-# @ai0x0/codex-ts
+# @beatmagic/codex-ts
 
 A TypeScript port of the codex-rs agent core — runs the Codex sampling loop
 (Responses API streaming + tool calls + auto-compaction) directly in Node or the
 browser, with no spawned process.
 
 ```ts
-import { CodexThread } from "@ai0x0/codex-ts";
+import { CodexThread } from "@beatmagic/codex-ts";
 
 const thread = new CodexThread({
   apiKey: "…",

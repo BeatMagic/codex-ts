@@ -152,12 +152,23 @@ export function buildCompactedHistory(
  *   3. Build replacement history and mutate `history` in-place
  *
  * mirrors run_inline_auto_compact_task + run_compact_task_inner_impl in compact.rs
- * Returns the raw summary text (without SUMMARY_PREFIX).
+ * Returns the raw summary text (without SUMMARY_PREFIX), or null when the
+ * compaction was dropped as STALE — in that case `history` is left exactly as it
+ * was found. See `isStaleCompaction` below.
  */
 export async function runInlineAutoCompactTask(
   history: ConversationItem[],
-  config: TurnConfig,
-): Promise<string> {
+  config: TurnConfig & {
+    /**
+     * Asked ONCE, immediately before this summary would rewrite `history`.
+     * Returning true means another compaction landed while this summarizer was
+     * in flight, so this summary describes a history that no longer exists.
+     * See AutoCompactWindow.currentCompactionEpoch for why that is reachable.
+     * Absent = never stale, i.e. codex-rs behavior.
+     */
+    isStaleCompaction?: (() => boolean) | undefined;
+  },
+): Promise<string | null> {
   // Working copy sent to the summarizer. When the compaction request ITSELF
   // exceeds the context window, drop the OLDEST item and retry (mirrors
   // compact.rs:232-241 history.remove_first_item(): trims from the front to
@@ -277,6 +288,16 @@ export async function runInlineAutoCompactTask(
       }
       throw err;
     }
+  }
+
+  // LAST CHANCE TO NOT REWRITE HISTORY. Everything above is a network round
+  // trip, and `history` is the thread's LIVE array, shared with every concurrent
+  // turn. The check sits here — immediately before the mutation — so that no
+  // reordering of the code above can leave a window where a stale summary still
+  // gets applied. Returning null also tells the caller to skip the
+  // ContextCompacted event and the token reseed.
+  if (config.isStaleCompaction?.()) {
+    return null;
   }
 
   const fullSummary = `${SUMMARY_PREFIX}\n${summaryText}`;

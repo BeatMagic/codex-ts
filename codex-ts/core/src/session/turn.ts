@@ -14,6 +14,10 @@ import type { EventMsg } from "../../../protocol/src/protocol.js";
 import type { UserInput } from "../../../protocol/src/user_input.js";
 import { toolSpecToRequestJson } from "../../../tools/src/tool_spec.js";
 import { ToolRouter } from "../tools/router.js";
+import {
+  canonicalizeStoredArguments,
+  parseToolArguments,
+} from "../tools/argument_repair.js";
 import { extractSkillMentions, renderSkillInjection } from "../skills.js";
 import type { SkillMetadata } from "../skills.js";
 import type { PendingInputs } from "../tools/handlers/request_user_input.js";
@@ -183,8 +187,35 @@ async function runCompactAndRecompute(
   tokenState: SessionTokenState,
   emitEvent: (msg: EventMsg) => void,
 ): Promise<void> {
+  // The window's generation, read BEFORE the summarizer runs; see
+  // AutoCompactWindow.currentCompactionEpoch for why a late compaction must not
+  // be allowed to rewrite history.
+  const epochAtEntry = compactWindow.currentCompactionEpoch();
+  const applied = await runInlineAutoCompactTask(history, {
+    ...config,
+    isStaleCompaction: () =>
+      compactWindow.currentCompactionEpoch() !== epochAtEntry,
+  });
+  if (applied === null) {
+    // Logged because a silently dropped compaction is indistinguishable from
+    // one that never triggered.
+    console.warn(
+      `[codex] dropped a stale compaction: the context window already rolled ` +
+        `over (epoch ${epochAtEntry} → ${compactWindow.currentCompactionEpoch()}) ` +
+        `while this summarizer was in flight; history was NOT rewritten`,
+    );
+    return;
+  }
+  // Emitted only AFTER runInlineAutoCompactTask has actually rebuilt+replaced
+  // history — not optimistically before the summarizer runs. A stalled, aborted
+  // or superseded compaction throws (or returns null) out of the await and emits
+  // NO ContextCompacted, so a failed compaction can no longer advertise a
+  // phantom success (2026-07-31: nine ContextCompacted while history collapsed
+  // exactly once).
   emitEvent({ type: "ContextCompacted", event: {} });
-  await runInlineAutoCompactTask(history, config);
+  // Bump AFTER a replacement actually landed, so every compaction still in
+  // flight becomes stale from this instant.
+  compactWindow.bumpCompactionEpoch();
   // mirrors advance_auto_compact_window (compact.rs:359) followed by
   // replace_compacted_history → replace_history's clear_prefill
   // (state/session.rs:122): one call does both here.
@@ -355,6 +386,24 @@ export async function runTurn(
     // outputs. Anthropic 400s on unpaired tool_use/tool_result otherwise.
     normalizeHistory(history);
 
+    // ── Replay hygiene ──────────────────────────────────────────────────────
+    // Execution repairs malformed tool arguments before dispatch, but history
+    // keeps the model's ORIGINAL text; a downstream replay converter that
+    // plain-JSON.parses it zeroes the call to `input: {}` and the model then
+    // "redoes" a call that already succeeded. Canonicalize in place BEFORE the
+    // item is ever sent back. See tools/argument_repair.ts.
+    for (const item of history) {
+      if (
+        item.type === "function_call" &&
+        typeof item.arguments === "string"
+      ) {
+        item.arguments = canonicalizeStoredArguments(
+          item.arguments,
+          item.name ?? "",
+        );
+      }
+    }
+
     // ── Sample from the model ───────────────────────────────────────────────
     const body: Record<string, unknown> = {
       model: config.model,
@@ -395,6 +444,10 @@ export async function runTurn(
       currentItemId = `item-${++itemIdCounter}`;
       inputTokensThisRound = 0;
       let emittedOutput = false;
+      // Whether THIS attempt's stream has already delivered response.completed.
+      // A terminal event is terminal — anything arriving after it is transport
+      // noise, not turn state. See the response.failed arm below.
+      let sawCompleted = false;
 
       try {
         const res = await (config.fetch ?? fetch)(
@@ -429,6 +482,20 @@ export async function runTurn(
               // response.function_call_arguments.delta），故此处只跟踪 message item id。
               if (item?.["type"] === "message") {
                 currentItemId = String(item["id"] ?? currentItemId);
+              } else if (item?.["type"] === "function_call") {
+                // Announce the call the moment the model starts emitting it —
+                // name known, arguments not yet streamed — so a host can show
+                // the in-progress tool during composition instead of a blank
+                // spinner. DISPLAY ONLY: the dispatched arguments still come
+                // solely from output_item.done (see the rule at that arm).
+                emitEvent({
+                  type: "FunctionCallStreamStart",
+                  event: {
+                    id: String(item["id"] ?? item["call_id"] ?? ""),
+                    name: String(item["name"] ?? ""),
+                    turn_id: turnId,
+                  },
+                });
               }
               break;
             }
@@ -474,9 +541,24 @@ export async function runTurn(
               });
               break;
             }
-            // response.function_call_arguments.delta 不处理：function_call 的
+            // response.function_call_arguments.delta 不累积：function_call 的
             // arguments 整体来自 output_item.done；codex-rs 亦丢弃该 delta 事件
             // （codex-api/src/sse/responses.rs 落 `_ =>`），不做累积。
+            case "response.function_call_arguments.delta": {
+              // Forwarded raw (keyed by item_id) so a host can accumulate and
+              // show the in-progress tool during composition. DISPLAY ONLY by
+              // construction: nothing here feeds `functionCalls`, so the rule
+              // above — arguments come only from output_item.done — still holds.
+              emitEvent({
+                type: "FunctionCallStreamArgs",
+                event: {
+                  delta: String(raw["delta"] ?? ""),
+                  id: String(raw["item_id"] ?? raw["call_id"] ?? ""),
+                  turn_id: turnId,
+                },
+              });
+              break;
+            }
             case "response.output_item.done": {
               const item = raw["item"] as Record<string, unknown> | undefined;
               if (item?.["type"] === "function_call") {
@@ -495,6 +577,9 @@ export async function runTurn(
               // backend emits, so usage never arrived and auto-compaction never armed.)
               // Mirrors record_token_usage_info (turn.rs:2072): session total ←
               // usage, window prefill ← first server-observed input_tokens.
+              // Recorded BEFORE the usage guard: a completed frame without
+              // parsable usage still completes the turn.
+              sawCompleted = true;
               const resp = raw["response"] as
                 | Record<string, unknown>
                 | undefined;
@@ -571,6 +656,17 @@ export async function runTurn(
             }
             case "response.failed":
             case "response.incomplete": {
+              // A failed/incomplete arriving AFTER response.completed must not
+              // un-complete the turn. Observed 2026-08-04 in production: the
+              // upstream delivered the full stream then held the connection
+              // open, and a gateway watchdog sealed the hold with a synthetic
+              // response.incomplete AFTER the completed frame. Throwing here
+              // classified a COMPLETE turn as a retryable 503, so the client
+              // re-sent the byte-identical request in an endless token-burning
+              // loop. First terminal event wins; later ones are transport noise.
+              if (sawCompleted) {
+                break;
+              }
               // mirrors codex-api sse/responses.rs process_responses_event's
               // terminal arms (responses.rs:387-431): `response.failed` is
               // classified from `response.error.code` — quota / cyber-policy /
@@ -658,7 +754,10 @@ export async function runTurn(
       }
       let args: unknown;
       try {
-        args = JSON.parse(call.arguments);
+        // Strict parse runs FIRST inside parseToolArguments, so a well-formed
+        // call is untouched; only already-invalid arguments reach the repair,
+        // and an unrepairable one throws a message the model can act on.
+        args = parseToolArguments(call.arguments, call.name);
         if (typeof args !== "object" || args === null || Array.isArray(args)) {
           // rs 的 from_str::<Struct> 对非对象（如 "5"、"[...]"）同样失败。
           throw new Error("expected a JSON object");
