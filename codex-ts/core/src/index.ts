@@ -8,8 +8,11 @@ export { AutoCompactWindow } from "./state/auto_compact_window.js";
 export {
   approxTokenCount,
   estimateItemsTokenCount,
+  estimateTokensAfterLastModelGeneratedItem,
+  recomputeTokenUsage,
   SessionTokenState,
 } from "./state/token_state.js";
+export type { RecomputeTokenUsageParams } from "./state/token_state.js";
 export {
   classifyStreamFailure,
   codexErrorInfoFor,
