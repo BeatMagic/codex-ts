@@ -41,8 +41,7 @@ import { runInlineAutoCompactTask } from "../compact.js";
 import { normalizeHistory } from "../normalize.js";
 import { AutoCompactWindow } from "../state/auto_compact_window.js";
 import {
-  approxTokenCount,
-  estimateItemsTokenCount,
+  recomputeTokenUsage,
   SessionTokenState,
 } from "../state/token_state.js";
 
@@ -154,11 +153,18 @@ function autoCompactTokenStatus(
   config: TurnConfig,
   compactWindow: AutoCompactWindow,
   tokenState: SessionTokenState,
+  history: ConversationItem[],
 ): {
   activeContextTokens: number;
   tokenLimitReached: boolean;
 } {
-  const activeContextTokens = tokenState.totalTokens ?? 0;
+  // getTotalTokenUsage, not the bare total: the items appended since the last
+  // sampled response (this turn's user message, and — at the mid-turn
+  // checkpoint — the tool outputs just recorded) are part of what the NEXT
+  // request carries but are invisible to the server's usage number. rs feeds
+  // the same adjusted figure into both limbs of this check
+  // (session/context_window.rs:27,46,76).
+  const activeContextTokens = tokenState.getTotalTokenUsage(history);
   const scopeTokens = compactWindow.bodyAfterPrefix(activeContextTokens);
   const scopeLimit =
     config.autoCompactTokenLimit ?? Number.POSITIVE_INFINITY;
@@ -220,11 +226,18 @@ async function runCompactAndRecompute(
   // replace_compacted_history → replace_history's clear_prefill
   // (state/session.rs:122): one call does both here.
   compactWindow.startNewContextWindow();
-  const estimated =
-    estimateItemsTokenCount([...(config.contextItems ?? []), ...history]) +
-    approxTokenCount(config.instructions ?? "");
-  tokenState.setEstimated(estimated);
-  compactWindow.setEstimatedPrefill(estimated);
+  recomputeTokenUsage({
+    items: [...(config.contextItems ?? []), ...history],
+    instructions: config.instructions,
+    tokenState,
+    compactWindow,
+    contextWindow: config.contextWindow,
+    // rs's recompute ends in send_token_count_event (session/mod.rs:4031).
+    // Without it a host's context meter keeps showing the PRE-compaction
+    // number until the next sampled response — the one moment a user is most
+    // likely to be looking at it.
+    emitEvent,
+  });
   emitEvent({
     type: "Warning",
     event: {
@@ -346,13 +359,16 @@ export async function runTurn(
   // a byte-based estimate of what this turn is about to send. Server usage
   // overrides both on the next sampled response.
   if (compactWindow.snapshot().prefillInputTokens === null) {
-    const estimated =
-      estimateItemsTokenCount([...(config.contextItems ?? []), ...history]) +
-      approxTokenCount(config.instructions ?? "");
-    compactWindow.setEstimatedPrefill(estimated);
-    if (tokenState.totalTokens === null) {
-      tokenState.setEstimated(estimated);
-    }
+    recomputeTokenUsage({
+      items: [...(config.contextItems ?? []), ...history],
+      instructions: config.instructions,
+      tokenState,
+      compactWindow,
+      // Seed only: a session total that already exists (server usage carried
+      // over from an earlier window) must not be overwritten by an estimate.
+      // What is missing here is the window baseline, not the total.
+      overwriteTotal: tokenState.totalTokens === null,
+    });
   }
 
   // ── Pre-sampling compaction (mirrors run_pre_sampling_compact, turn.rs:149) ─
@@ -362,7 +378,12 @@ export async function runTurn(
   // history estimate already exceeds the window. This is the self-heal path:
   // without it, every subsequent request would keep failing with 400.
   {
-    const preStatus = autoCompactTokenStatus(config, compactWindow, tokenState);
+    const preStatus = autoCompactTokenStatus(
+      config,
+      compactWindow,
+      tokenState,
+      history,
+    );
     if (preStatus.tokenLimitReached) {
       await runCompactAndRecompute(
         history,
@@ -809,7 +830,12 @@ export async function runTurn(
     // Fires on EITHER growth-since-baseline ≥ autoCompactTokenLimit OR total
     // active context ≥ contextWindow (see autoCompactTokenStatus).
     {
-      const status = autoCompactTokenStatus(config, compactWindow, tokenState);
+      const status = autoCompactTokenStatus(
+        config,
+        compactWindow,
+        tokenState,
+        history,
+      );
       // mirrors should_roll_over (turn.rs:418-420): mid-turn compaction fires
       // when the token limit is reached OR a new context window was explicitly
       // requested (rs's `new_context` tool; in codex-ts a host can request one
