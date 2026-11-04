@@ -21,7 +21,11 @@ import {
   sleep,
 } from "./session/retry.js";
 import { normalizeHistory, removeCorrespondingFor } from "./normalize.js";
-import { estimateItemsTokenCount } from "./state/token_state.js";
+import {
+  approxTokenCount,
+  estimateItemsTokenCount,
+  utf8ByteLength,
+} from "./state/token_state.js";
 
 // ─── Prompt constants (verbatim from codex-rs templates) ──────────────────────
 
@@ -48,15 +52,25 @@ export const SUMMARY_PREFIX =
 const COMPACT_USER_MESSAGE_MAX_TOKENS = 20_000;
 
 // ─── Token approximation (mirrors codex-rs/utils/output-truncation) ───────────
+// approxTokenCount is ~4 UTF-8 bytes per token (state/token_state.ts).
 
-/** ~4 chars per token — cheap approximation, good enough for budget checks */
-function approxTokenCount(text: string): number {
-  return Math.ceil(text.length / 4);
-}
-
+/** Keep the longest prefix of `text` within `maxTokens` × 4 UTF-8 bytes,
+ *  never splitting a surrogate pair. */
 function truncateToTokens(text: string, maxTokens: number): string {
-  const maxChars = maxTokens * 4;
-  return text.length <= maxChars ? text : text.slice(0, maxChars);
+  const maxBytes = maxTokens * 4;
+  if (utf8ByteLength(text) <= maxBytes) return text;
+  let bytes = 0;
+  let end = 0;
+  while (end < text.length) {
+    const code = text.charCodeAt(end);
+    const pair = code >= 0xd800 && code <= 0xdbff && end + 1 < text.length;
+    const step = pair ? 2 : 1;
+    const size = utf8ByteLength(text.slice(end, end + step));
+    if (bytes + size > maxBytes) break;
+    bytes += size;
+    end += step;
+  }
+  return text.slice(0, end);
 }
 
 // ─── History helpers ─────────────────────────────────────────────────────────
@@ -167,6 +181,19 @@ export async function runInlineAutoCompactTask(
      * Absent = never stale, i.e. codex-rs behavior.
      */
     isStaleCompaction?: (() => boolean) | undefined;
+    /**
+     * Called SYNCHRONOUSLY right after `history` has been rewritten — same
+     * tick, no await in between — with the new history (now the live array)
+     * and the full summary message. The caller persists the checkpoint here:
+     * any await between the swap and the write would let a concurrent turn's
+     * append land on disk first and be lost on resume.
+     */
+    onHistoryReplaced?:
+      | ((replacement: ConversationItem[], summaryMessage: string) => void)
+      | undefined;
+    /** The turn's interrupt signal: aborts the summarizer request and any
+     *  retry wait, and guarantees an interrupted compaction rewrites nothing. */
+    abortSignal?: AbortSignal | undefined;
   },
 ): Promise<string | null> {
   // Working copy sent to the summarizer. When the compaction request ITSELF
@@ -179,6 +206,19 @@ export async function runInlineAutoCompactTask(
   // normalize_history) — Anthropic 400s on unpaired tool_use/tool_result.
   const summarizerInput: ConversationItem[] = [...history];
   normalizeHistory(summarizerInput);
+  // The items this summary will describe, by identity. Concurrent turns share
+  // `history` and keep appending while the summarizer runs (or rewrite it in
+  // place: normalizeHistory inserts placeholders) — whatever is not in this
+  // set at apply time is NEWER than the summary and is kept after it, instead
+  // of being silently dropped. mirrors the rs prefix install that appends the
+  // live suffix (session/mod.rs replace_compacted_history) and #59404.
+  const summarized = new Set<ConversationItem>(history);
+  const abortSignal = config.abortSignal;
+  const throwIfAborted = (): void => {
+    if (abortSignal?.aborted) {
+      throw new DOMException("Compaction interrupted", "AbortError");
+    }
+  };
   const maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES;
   let retries = 0;
   let trimRounds = 0;
@@ -189,6 +229,7 @@ export async function runInlineAutoCompactTask(
   const compactPrompt = config.compactPrompt ?? SUMMARIZATION_PROMPT;
 
   for (;;) {
+    throwIfAborted();
     // Build the compaction request: history + the summarization prompt at the end
     const compactInput: ConversationItem[] = [
       ...summarizerInput,
@@ -210,6 +251,7 @@ export async function runInlineAutoCompactTask(
           Authorization: `Bearer ${config.apiKey}`,
         },
         body: JSON.stringify(body),
+        signal: abortSignal ?? null,
       });
 
       if (!res.ok || !res.body) {
@@ -223,9 +265,15 @@ export async function runInlineAutoCompactTask(
 
       // Collect the assistant's summary text from the stream
       summaryText = "";
+      let sawCompleted = false;
       for await (const raw of parseSseStream(res.body)) {
         if (raw["type"] === "response.output_text.delta") {
           summaryText += String(raw["delta"] ?? "");
+        } else if (raw["type"] === "response.completed") {
+          // First terminal event wins: anything after it is transport noise
+          // (same rule as the turn loop's terminal_first_wins).
+          sawCompleted = true;
+          break;
         } else if (
           raw["type"] === "response.failed" ||
           raw["type"] === "response.incomplete"
@@ -236,8 +284,27 @@ export async function runInlineAutoCompactTask(
           throw classifyStreamFailure(raw);
         }
       }
+      // A summary is only a summary once the response COMPLETED: a stream that
+      // just ends is cut off, and applying it would replace the history with
+      // half a handoff — now durably, since the result is checkpointed.
+      // mirrors compact.rs "stream closed before response.completed" (#53932
+      // buffers until completion). An empty summary is rejected too, a
+      // deliberate tightening: this host has seen upstreams launder errors
+      // into empty 200 completions, and "(no summary available)" in place of
+      // the whole history is data loss. Both stay retryable.
+      if (!sawCompleted) {
+        throw new ResponsesApiError(
+          503,
+          "summarizer stream closed before response.completed",
+        );
+      }
+      if (summaryText.trim() === "") {
+        throw new ResponsesApiError(503, "summarizer returned an empty summary");
+      }
       break; // summary collected → leave the retry loop
     } catch (err) {
+      // An interrupt is terminal — never retry or trim past a cancellation.
+      if (abortSignal?.aborted) throw err;
       if (isContextWindowExceededError(err)) {
         if (summarizerInput.length > 1) {
           // mirrors compact.rs:233-240 + history.remove_first_item: drop the
@@ -283,7 +350,7 @@ export async function runInlineAutoCompactTask(
       // Transient failures back off and retry (mirrors compact.rs:248-259).
       if (retries < maxRetries && isRetryableError(err)) {
         retries += 1;
-        await sleep(computeRetryDelay(err, retries));
+        await sleep(computeRetryDelay(err, retries), abortSignal);
         continue;
       }
       throw err;
@@ -296,19 +363,33 @@ export async function runInlineAutoCompactTask(
   // reordering of the code above can leave a window where a stale summary still
   // gets applied. Returning null also tells the caller to skip the
   // ContextCompacted event and the token reseed.
+  throwIfAborted();
   if (config.isStaleCompaction?.()) {
     return null;
   }
 
   const fullSummary = `${SUMMARY_PREFIX}\n${summaryText}`;
 
-  // Collect recent user messages from the pre-compaction history
-  const userMessages = collectUserMessages(history);
+  // Split the live history into what the summary covers and what arrived
+  // while it was being written (see `summarized` above).
+  const covered = history.filter((item) => summarized.has(item));
+  const newer = history.filter((item) => !summarized.has(item));
 
-  // Build replacement history and mutate in place
-  const newHistory = buildCompactedHistory(userMessages, fullSummary);
+  // Collect recent user messages from the summarized part only
+  const userMessages = collectUserMessages(covered);
+
+  // Build replacement history and mutate in place: summary first, then the
+  // newer items (mirrors compact_pending_input::insert_summary). Pairing is
+  // re-established for the newer part: an output whose call was summarized
+  // away would otherwise be an orphan the next request trips over.
+  const newHistory = [
+    ...buildCompactedHistory(userMessages, fullSummary),
+    ...newer,
+  ];
+  normalizeHistory(newHistory);
   history.length = 0;
   for (const item of newHistory) history.push(item);
+  config.onHistoryReplaced?.(history, fullSummary);
 
   return summaryText;
 }

@@ -43,6 +43,7 @@ import { AutoCompactWindow } from "../state/auto_compact_window.js";
 import {
   recomputeTokenUsage,
   SessionTokenState,
+  totalOnlyTokenCountEvent,
 } from "../state/token_state.js";
 
 // ConversationItem from thread-store is the canonical type for both
@@ -179,12 +180,52 @@ function autoCompactTokenStatus(
 }
 
 /**
+ * Emit a TokenCount and persist it, so a resumed thread can seed its token
+ * state from the last one (mirrors rs persisting EventMsg::TokenCount,
+ * rollout/src/policy.rs). Persistence is queued, never awaited: the ordered
+ * queue keeps it after every append issued before it.
+ */
+function recordTokenCount(
+  msg: EventMsg,
+  emitEvent: (msg: EventMsg) => void,
+  liveThread: LiveThread | undefined,
+): void {
+  emitEvent(msg);
+  void liveThread?.appendEvent(msg);
+}
+
+/**
+ * Mark the session context FULL after a context-window-exceeded rejection and
+ * record it. mirrors set_total_tokens_full → send_token_count_event
+ * (session/mod.rs): the mark is persisted, so the self-heal (the next turn
+ * compacts first) survives an app restart instead of dying with the process.
+ */
+function markContextFull(
+  config: TurnConfig,
+  tokenState: SessionTokenState,
+  emitEvent: (msg: EventMsg) => void,
+  liveThread: LiveThread | undefined,
+): void {
+  if (config.contextWindow === undefined) return;
+  tokenState.setFull(config.contextWindow);
+  recordTokenCount(
+    totalOnlyTokenCountEvent(config.contextWindow, config.contextWindow),
+    emitEvent,
+    liveThread,
+  );
+}
+
+/**
  * Run one inline compaction and reseed the token bookkeeping.
  * mirrors run_auto_compact + recompute_token_usage (compact.rs:359-386 +
  * session/mod.rs:3794-3831): after history is rewritten, the session total and
  * the NEW window's baseline both restart from a byte-based estimate of the
  * compacted context (replaced by real server usage on the next sampled
  * response).
+ *
+ * The rewrite is checkpointed (mirrors replace_compacted_history persisting
+ * Compacted in the same lock section as the in-memory swap): a resumed thread
+ * starts from the compacted history instead of replaying every raw item.
  */
 async function runCompactAndRecompute(
   history: ConversationItem[],
@@ -192,16 +233,76 @@ async function runCompactAndRecompute(
   compactWindow: AutoCompactWindow,
   tokenState: SessionTokenState,
   emitEvent: (msg: EventMsg) => void,
+  liveThread: LiveThread | undefined,
+  abortSignal: AbortSignal | undefined,
 ): Promise<void> {
   // The window's generation, read BEFORE the summarizer runs; see
   // AutoCompactWindow.currentCompactionEpoch for why a late compaction must not
   // be allowed to rewrite history.
   const epochAtEntry = compactWindow.currentCompactionEpoch();
-  const applied = await runInlineAutoCompactTask(history, {
-    ...config,
-    isStaleCompaction: () =>
-      compactWindow.currentCompactionEpoch() !== epochAtEntry,
-  });
+  let applied: string | null;
+  try {
+    applied = await runInlineAutoCompactTask(history, {
+      ...config,
+      abortSignal,
+      isStaleCompaction: () =>
+        compactWindow.currentCompactionEpoch() !== epochAtEntry,
+      // Runs in the SAME tick as the history swap. Everything that must be
+      // atomic with the rewrite happens here: the epoch bump (so a concurrent
+      // summarizer's stale check can no longer pass in a microtask window),
+      // the new window, the reseed, and the checkpoint write — queued before
+      // any append a concurrent turn can issue after the swap.
+      onHistoryReplaced: (replacement, summaryMessage) => {
+        // Bump AFTER a replacement actually landed, so every compaction still
+        // in flight becomes stale from this instant.
+        compactWindow.bumpCompactionEpoch();
+        // mirrors advance_auto_compact_window (compact.rs:359) followed by
+        // replace_compacted_history → replace_history's clear_prefill
+        // (state/session.rs:122): one call does both here.
+        const window = compactWindow.startNewContextWindow();
+        const estimated = recomputeTokenUsage({
+          items: [...(config.contextItems ?? []), ...replacement],
+          instructions: config.instructions,
+          tokenState,
+          compactWindow,
+          contextWindow: config.contextWindow,
+        });
+        void liveThread?.appendCompacted({
+          v: 1,
+          message: summaryMessage,
+          replacement_history: replacement,
+          window_number: window.windowNumber,
+          first_window_id: window.ids.firstWindowId,
+          previous_window_id: window.ids.previousWindowId,
+          window_id: window.ids.windowId,
+          token_total_after: estimated,
+        });
+        // Emitted only AFTER history has actually been rebuilt+replaced — not
+        // optimistically before the summarizer runs. A stalled, aborted or
+        // superseded compaction throws (or returns null) and emits NO
+        // ContextCompacted, so a failed compaction can no longer advertise a
+        // phantom success (2026-07-31: nine ContextCompacted while history
+        // collapsed exactly once).
+        emitEvent({ type: "ContextCompacted", event: {} });
+        // rs's recompute ends in send_token_count_event (session/mod.rs:4031).
+        // Without it a host's context meter keeps showing the PRE-compaction
+        // number until the next sampled response — the one moment a user is
+        // most likely to be looking at it. Persisted right after Compacted.
+        recordTokenCount(
+          totalOnlyTokenCountEvent(estimated, config.contextWindow),
+          emitEvent,
+          liveThread,
+        );
+      },
+    });
+  } catch (err) {
+    // The summarizer itself could not fit even after trimming: compact.ts has
+    // marked the tokens full — persist that mark too (see markContextFull).
+    if (isContextWindowExceededError(err)) {
+      markContextFull(config, tokenState, emitEvent, liveThread);
+    }
+    throw err;
+  }
   if (applied === null) {
     // Logged because a silently dropped compaction is indistinguishable from
     // one that never triggered.
@@ -212,32 +313,6 @@ async function runCompactAndRecompute(
     );
     return;
   }
-  // Emitted only AFTER runInlineAutoCompactTask has actually rebuilt+replaced
-  // history — not optimistically before the summarizer runs. A stalled, aborted
-  // or superseded compaction throws (or returns null) out of the await and emits
-  // NO ContextCompacted, so a failed compaction can no longer advertise a
-  // phantom success (2026-07-31: nine ContextCompacted while history collapsed
-  // exactly once).
-  emitEvent({ type: "ContextCompacted", event: {} });
-  // Bump AFTER a replacement actually landed, so every compaction still in
-  // flight becomes stale from this instant.
-  compactWindow.bumpCompactionEpoch();
-  // mirrors advance_auto_compact_window (compact.rs:359) followed by
-  // replace_compacted_history → replace_history's clear_prefill
-  // (state/session.rs:122): one call does both here.
-  compactWindow.startNewContextWindow();
-  recomputeTokenUsage({
-    items: [...(config.contextItems ?? []), ...history],
-    instructions: config.instructions,
-    tokenState,
-    compactWindow,
-    contextWindow: config.contextWindow,
-    // rs's recompute ends in send_token_count_event (session/mod.rs:4031).
-    // Without it a host's context meter keeps showing the PRE-compaction
-    // number until the next sampled response — the one moment a user is most
-    // likely to be looking at it.
-    emitEvent,
-  });
   emitEvent({
     type: "Warning",
     event: {
@@ -391,6 +466,8 @@ export async function runTurn(
         compactWindow,
         tokenState,
         emitEvent,
+        liveThread,
+        abortSignal,
       );
     }
   }
@@ -469,6 +546,11 @@ export async function runTurn(
       // A terminal event is terminal — anything arriving after it is transport
       // noise, not turn state. See the response.failed arm below.
       let sawCompleted = false;
+      // The compaction generation this request's history was built under.
+      // Concurrent turns share the session: if another turn compacted while
+      // this request was in flight, its usage measures a history that no
+      // longer exists. See the usage guard in the response.completed arm.
+      const epochAtBuild = compactWindow.currentCompactionEpoch();
 
       try {
         const res = await (config.fetch ?? fetch)(
@@ -609,18 +691,31 @@ export async function runTurn(
                 | undefined;
               if (typeof usage?.["input_tokens"] === "number") {
                 inputTokensThisRound = usage["input_tokens"];
-                tokenState.updateFromUsage({
-                  inputTokens: inputTokensThisRound,
-                  outputTokens:
-                    typeof usage["output_tokens"] === "number"
-                      ? usage["output_tokens"]
-                      : undefined,
-                  totalTokens:
-                    typeof usage["total_tokens"] === "number"
-                      ? usage["total_tokens"]
-                      : undefined,
-                });
-                compactWindow.ensureServerObservedPrefill(inputTokensThisRound);
+                // Usage from a request built BEFORE a compaction that landed
+                // meanwhile is display-only: writing it back would overwrite
+                // the post-compaction estimate with the old, larger history's
+                // size (re-arming compaction at once) and seed the new
+                // window's baseline from it. mirrors TokenUsageContext::
+                // SpendingOnly (#53670): recorded for spend, not for the
+                // context baseline.
+                const staleUsage =
+                  compactWindow.currentCompactionEpoch() !== epochAtBuild;
+                if (!staleUsage) {
+                  tokenState.updateFromUsage({
+                    inputTokens: inputTokensThisRound,
+                    outputTokens:
+                      typeof usage["output_tokens"] === "number"
+                        ? usage["output_tokens"]
+                        : undefined,
+                    totalTokens:
+                      typeof usage["total_tokens"] === "number"
+                        ? usage["total_tokens"]
+                        : undefined,
+                  });
+                  compactWindow.ensureServerObservedPrefill(
+                    inputTokensThisRound,
+                  );
+                }
                 // mirrors send_token_count_event (session/mod.rs:3131): emit the
                 // recorded usage so hosts can display context consumption. In the
                 // ts port the session total is REPLACED by each response's total
@@ -657,7 +752,7 @@ export async function runTurn(
                     inputTokensThisRound + numberOr(usage["output_tokens"], 0),
                   ),
                 };
-                emitEvent({
+                const tokenCount: EventMsg = {
                   type: "TokenCount",
                   event: {
                     info: {
@@ -671,7 +766,14 @@ export async function runTurn(
                     },
                     rate_limits: null,
                   },
-                });
+                };
+                // A stale measurement is shown but never persisted: a resume
+                // must seed from the current history's size.
+                if (staleUsage) {
+                  emitEvent(tokenCount);
+                } else {
+                  recordTokenCount(tokenCount, emitEvent, liveThread);
+                }
               }
               break;
             }
@@ -710,7 +812,7 @@ export async function runTurn(
         // before sampling (mirrors turn.rs:1045-1047 set_total_tokens_full).
         // Retrying the identical request would only fail again.
         if (isContextWindowExceededError(err)) {
-          tokenState.setFull(config.contextWindow);
+          markContextFull(config, tokenState, emitEvent, liveThread);
           throw err;
         }
         // Stop retrying once visible output streamed (would duplicate), the
@@ -849,6 +951,8 @@ export async function runTurn(
           compactWindow,
           tokenState,
           emitEvent,
+          liveThread,
+          abortSignal,
         );
       }
     }

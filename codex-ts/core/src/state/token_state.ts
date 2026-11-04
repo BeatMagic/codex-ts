@@ -14,21 +14,108 @@ import type { EventMsg } from "../../../protocol/src/protocol.js";
 import type { ConversationItem } from "../../../thread-store/src/types.js";
 import type { AutoCompactWindow } from "./auto_compact_window.js";
 
-/** ~4 chars per token — coarse lower bound, same heuristic as codex-rs
- *  approx_token_count (utils/output-truncation). Good enough for budgeting. */
-export function approxTokenCount(text: string): number {
-  return Math.ceil(text.length / 4);
+/**
+ * UTF-8 byte length of a string without allocating an encoded copy (history
+ * strings run to megabytes). 1 byte for ASCII, 2 up to U+07FF, 3 for the rest
+ * of the BMP, 4 for a surrogate pair; a lone surrogate counts as 3 (U+FFFD).
+ */
+export function utf8ByteLength(text: string): number {
+  let bytes = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code < 0x80) {
+      bytes += 1;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      const next = text.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        index += 1;
+      } else {
+        bytes += 3;
+      }
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
 }
 
 /**
- * Estimate the token size of serialized conversation items.
+ * ~4 UTF-8 bytes per token — the codex-rs approx_token_count heuristic
+ * (utils/string/src/truncate.rs: bytes, not chars). Counting UTF-16 units, as
+ * the original port did, under-reports CJK text about 3× — and a resumed
+ * thread's first compaction decision rests on this estimate.
+ */
+export function approxTokenCount(text: string): number {
+  return Math.ceil(utf8ByteLength(text) / 4);
+}
+
+/** Fixed byte cost of an image part, whatever its URL form (rs counts images
+ *  by modality, not by the size of their data URL: history.rs, #45094). */
+const IMAGE_PART_BYTES = 7_373;
+/** Fixed byte cost of an audio part (no duration is known here). */
+const AUDIO_PART_BYTES = 7_373;
+/** Per-item envelope (type / role / call_id keys) on the wire. */
+const ITEM_ENVELOPE_BYTES = 32;
+
+function jsonStringBytes(text: string): number {
+  // JSON-escaped, as on the wire: quotes and backslashes in tool output JSON
+  // inflate the request, and real token density of such content is HIGHER
+  // than 4 bytes/token — keeping the escaping errs on the early side.
+  return utf8ByteLength(JSON.stringify(text));
+}
+
+function contentBytes(content: unknown): number {
+  if (typeof content === "string") return jsonStringBytes(content);
+  if (Array.isArray(content)) {
+    let bytes = 0;
+    for (const part of content) {
+      const type = (part as { type?: unknown } | null)?.type;
+      if (type === "input_text" || type === "output_text") {
+        bytes += jsonStringBytes(String((part as { text?: unknown }).text ?? ""));
+      } else if (type === "input_image") {
+        bytes += IMAGE_PART_BYTES;
+      } else if (type === "input_audio") {
+        bytes += AUDIO_PART_BYTES;
+      } else {
+        bytes += utf8ByteLength(JSON.stringify(part) ?? "");
+      }
+    }
+    return bytes;
+  }
+  return utf8ByteLength(JSON.stringify(content) ?? "");
+}
+
+/** Estimated tokens of one conversation item. */
+export function estimateItemTokenCount(item: ConversationItem): number {
+  let bytes = ITEM_ENVELOPE_BYTES;
+  switch (item.type) {
+    case "message":
+      bytes += contentBytes(item.content);
+      break;
+    case "function_call":
+      bytes += utf8ByteLength(item.name) + jsonStringBytes(item.arguments);
+      break;
+    case "function_call_output":
+      // Typed string, but hosts store content-part arrays here (view_image).
+      bytes += contentBytes(item.output as unknown);
+      break;
+  }
+  return Math.ceil(bytes / 4);
+}
+
+/**
+ * Estimate the token size of conversation items.
  * mirrors history.estimate_token_count_with_base_instructions (history.rs:149):
- * per-item byte-based estimates, summed. JSON form approximates wire size.
+ * per-item estimates, summed — UTF-8 bytes / 4, images and audio at a fixed
+ * cost instead of the length of their (possibly base64) URL.
  */
 export function estimateItemsTokenCount(items: ConversationItem[]): number {
   let total = 0;
   for (const item of items) {
-    total += approxTokenCount(JSON.stringify(item));
+    total += estimateItemTokenCount(item);
   }
   return total;
 }
@@ -150,6 +237,17 @@ export class SessionTokenState {
   }
 
   /**
+   * Restore a total persisted by a previous run of this thread (resume).
+   * mirrors seeding token_info from the last rollout TokenCount
+   * (session/mod.rs last_token_info_from_rollout). Treated as a server total:
+   * items appended after the last model output are added on top of it.
+   */
+  restore(tokens: number): void {
+    this.total = Math.max(0, tokens);
+    this.source = "server";
+  }
+
+  /**
    * Seed/replace the total with a byte-based estimate — used before the first
    * server usage arrives and after compaction rewrites history.
    * mirrors recompute_token_usage (session/mod.rs:3994).
@@ -221,28 +319,38 @@ export function recomputeTokenUsage(params: RecomputeTokenUsageParams): number {
   }
   compactWindow?.setEstimatedPrefill(estimated);
   if (emitEvent) {
-    // mirrors the TokenUsage rs writes into last_token_usage: every component
-    // zeroed except the recomputed total, because an estimate cannot attribute
-    // input/output/cache shares.
-    const usage = {
-      input_tokens: 0,
-      cached_input_tokens: 0,
-      cache_write_input_tokens: 0,
-      output_tokens: 0,
-      reasoning_output_tokens: 0,
-      total_tokens: estimated,
-    };
-    emitEvent({
-      type: "TokenCount",
-      event: {
-        info: {
-          total_token_usage: { ...usage },
-          last_token_usage: { ...usage },
-          model_context_window: contextWindow ?? null,
-        },
-        rate_limits: null,
-      },
-    });
+    emitEvent(totalOnlyTokenCountEvent(estimated, contextWindow));
   }
   return estimated;
+}
+
+/**
+ * A TokenCount event carrying only a total — for values that are not a
+ * server measurement (a recompute estimate, a forced-full mark). mirrors the
+ * TokenUsage rs writes into last_token_usage: every component zeroed except
+ * the total, because an estimate cannot attribute input/output/cache shares.
+ */
+export function totalOnlyTokenCountEvent(
+  total: number,
+  contextWindow: number | undefined,
+): EventMsg {
+  const usage = {
+    input_tokens: 0,
+    cached_input_tokens: 0,
+    cache_write_input_tokens: 0,
+    output_tokens: 0,
+    reasoning_output_tokens: 0,
+    total_tokens: total,
+  };
+  return {
+    type: "TokenCount",
+    event: {
+      info: {
+        total_token_usage: { ...usage },
+        last_token_usage: { ...usage },
+        model_context_window: contextWindow ?? null,
+      },
+      rate_limits: null,
+    },
+  };
 }
