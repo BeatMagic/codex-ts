@@ -1,4 +1,5 @@
 export type {
+  CompactedItem,
   ConversationItem,
   RolloutItem,
   CreateThreadParams,
@@ -18,3 +19,5 @@ export { IndexedDBIoBackend } from "./indexeddb.js";
 export { InMemoryThreadStore } from "./in_memory.js";
 export { LocalThreadStore } from "./local_thread_store.js";
 export { LiveThread } from "./live_thread.js";
+export { reconstructModelContext } from "./reconstruct.js";
+export type { ResumeState } from "./reconstruct.js";

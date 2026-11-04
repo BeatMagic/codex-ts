@@ -300,8 +300,33 @@ export class CodexThread {
   static async create(config: CodexThreadConfig): Promise<CodexThread> {
     const thread = new CodexThread(config);
     if (config.threadId) {
-      const items = await thread.liveThread.loadConversationHistory();
-      thread.history.push(...items);
+      // The MODEL context, not the raw transcript: the newest compaction
+      // checkpoint plus everything appended after it (mirrors rs
+      // reconstruct_rollout). Replaying every raw item — what this did before
+      // checkpoints were persisted — brought compacted threads back larger
+      // than the context window.
+      const state = await thread.liveThread.loadResumeState();
+      thread.history.push(...state.history);
+      const checkpoint = state.checkpoint;
+      if (
+        checkpoint &&
+        typeof checkpoint.window_number === "number" &&
+        typeof checkpoint.first_window_id === "string" &&
+        typeof checkpoint.window_id === "string"
+      ) {
+        thread.compactWindow.restore(checkpoint.window_number, {
+          firstWindowId: checkpoint.first_window_id,
+          previousWindowId: checkpoint.previous_window_id ?? null,
+          windowId: checkpoint.window_id,
+        });
+      }
+      // Seed the session total from the last persisted measurement (mirrors
+      // last_token_info_from_rollout). The first turn then compares a
+      // server-grounded number — or a persisted forced-full mark — against the
+      // window, instead of a fresh estimate that under-reads dense threads.
+      if (state.lastTokenTotal !== null) {
+        thread.tokenState.restore(state.lastTokenTotal);
+      }
     }
     return thread;
   }

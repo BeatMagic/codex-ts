@@ -86,3 +86,35 @@ const thread = new CodexThread({
 
 The same budget covers both the initial request and a stream that drops before
 any output; `Retry-After` overrides the computed backoff for that attempt.
+
+## Persistence and resume
+
+With a `threadStore` or `ioBackend`, a thread's rollout is persisted as one
+append-only log per thread, mirroring codex-rs's rollout:
+
+- every conversation item (`ConversationItem`), in the order it entered history;
+- a `Compacted` checkpoint each time inline auto-compaction rewrites history —
+  the summary message plus the complete replacement history, written in the same
+  tick as the in-memory swap;
+- `TokenCount` events: the server-measured total after each sampled response,
+  the estimate right after a compaction, and the forced-full mark set when the
+  provider rejects a request as too long.
+
+Appends go through an ordered queue, so lines land in call order even when
+concurrent turns share a thread and the backend completes writes out of order.
+A failed write is logged and skipped; it never fails the turn.
+
+`CodexThread.create({ threadId, … })` resumes from the **newest** checkpoint and
+replays only the items appended after it (codex-rs `reconstruct_rollout`), then
+seeds the session token total from the last `TokenCount` after that checkpoint.
+A thread that was past its context window — or was just rejected as too long —
+therefore compacts before its first sample after a restart, instead of sending
+an oversized request.
+
+`LiveThread.loadConversationHistory()` still returns the **raw** transcript —
+every item ever appended — for chat UIs; use `LiveThread.loadResumeState()`
+for the model-visible context.
+
+Logs written before checkpoints existed (no `Compacted` line) resume as a full
+replay, as before. Older readers skip the new line kinds and keep their full
+replay, so mixed runtimes are safe.

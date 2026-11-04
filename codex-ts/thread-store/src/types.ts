@@ -41,13 +41,50 @@ export type ConversationItem =
 
 // ─── RolloutItem — mirrors codex-rs/protocol/src/protocol.rs RolloutItem ─────
 //
-// The serialisable unit persisted to the backing store.
-// SessionMeta / ResponseItem / Compacted variants are omitted; we only need
-// ConversationItem (history) and EventMsg (for replay / analytics).
+// The serialisable unit persisted to the backing store. SessionMeta /
+// ResponseItem / TurnContext / WorldState are omitted; codex-ts needs
+// ConversationItem (history), EventMsg (TokenCount for resume seeding) and
+// Compacted (the checkpoint a resume starts from).
+//
+// Compacted was omitted in the original port, and that was a production bug:
+// compaction only rewrote the in-memory history, so a resumed thread replayed
+// every raw item ever appended and came back larger than the context window
+// (2026-11-04: a compacted 260KB director thread resumed as 2.5MB / 1.05M
+// tokens and was rejected "prompt is too long").
+//
+// Back-compat: readers that predate Compacted keep only `kind ===
+// "ConversationItem"` lines (LiveThread.loadConversationHistory), so they skip
+// the new lines and fall back to a full raw replay — the old behavior, no crash.
+
+/**
+ * A compaction checkpoint. mirrors codex-rs CompactedItem
+ * (history/src/lib.rs `Compacted(Box<CompactedItem>)`, written by
+ * Session::replace_compacted_history in one append with the in-memory swap).
+ */
+export interface CompactedItem {
+  /** Format version, for future readers. */
+  v: 1;
+  /** Full summary message text incl. SUMMARY_PREFIX (rs CompactedItem.message). */
+  message: string;
+  /**
+   * The complete history right after the rewrite. A resume starts from this
+   * snapshot and replays only the ConversationItems appended after this line.
+   */
+  replacement_history: ConversationItem[];
+  /** Compaction window the rewrite opened (AutoCompactWindow.restore on resume). */
+  window_number?: number | undefined;
+  first_window_id?: string | undefined;
+  previous_window_id?: string | null | undefined;
+  window_id?: string | undefined;
+  /** The recompute estimate of the compacted context — the resume seed when no
+   *  later TokenCount line exists. */
+  token_total_after?: number | undefined;
+}
 
 export type RolloutItem =
   | { kind: "ConversationItem"; item: ConversationItem }
-  | { kind: "EventMsg"; msg: EventMsg };
+  | { kind: "EventMsg"; msg: EventMsg }
+  | { kind: "Compacted"; compacted: CompactedItem };
 
 // ─── Params — mirrors codex-rs/thread-store/src/types.rs ─────────────────────
 
