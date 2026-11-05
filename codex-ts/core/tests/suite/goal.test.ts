@@ -191,11 +191,11 @@ describe("enableGoalTools: false", () => {
     });
     const emitEvent = vi.fn();
     const out = JSON.parse(
-      await router.dispatch("create_goal", "call-1", { objective: "x" }, {
+      (await router.dispatch("create_goal", "call-1", { objective: "x" }, {
         turnId: "t",
         pendingInputs: new Map(),
         emitEvent,
-      }),
+      })) as string,
     ) as { error: string; known_tools: string[] };
     expect(out.error).toBe("Unknown tool: create_goal");
     expect(out.known_tools).toEqual(router.toolSpecs().map((spec) => spec.tool.name));

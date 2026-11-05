@@ -123,7 +123,7 @@ describe("unknown tool error", () => {
       turnId: "t1",
       emitEvent: () => undefined,
     } as never);
-    const parsed = JSON.parse(out) as {
+    const parsed = JSON.parse(out as string) as {
       error: string;
       known_tools: string[];
       hint: string;

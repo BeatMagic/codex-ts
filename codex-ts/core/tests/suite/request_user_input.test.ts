@@ -355,3 +355,54 @@ describe("request_user_input forwards autoResolutionMs to the event", () => {
     await waitForEvent(codex, (m) => m.type === "TurnComplete");
   });
 });
+
+// mirrors handlers/request_user_input.rs: the wait ends once the turn is
+// cancelled. A parked turn used to ignore Interrupt entirely — no TurnAborted,
+// and the leaked resolver kept hasPendingInput(turnId) true.
+describe("interrupting a parked request_user_input", () => {
+  it("ends the turn, drops the pending entry, and a late answer is a no-op", async () => {
+    const callId = "call-rui-interrupt";
+    const capturedBodies: { input: { type?: string; call_id?: string; output?: unknown }[] }[] = [];
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      capturedBodies.push(JSON.parse(init.body as string) as (typeof capturedBodies)[number]);
+      if (capturedBodies.length === 1) {
+        return makeSseResponse(makeRequestUserInputArgs(callId));
+      }
+      return makeSseResponse(
+        sseFlat([evResponseCreated("resp-2"), evAssistantMessage("ok"), evCompleted("resp-2")]),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const codex = new CodexThread({ apiKey: "test", model: "gpt-4o" });
+    await codex.submit({ type: "UserInput", items: [{ type: "text", text: "ask" }] });
+    const request = await waitForEventMatch<RequestUserInputEvent>(codex, (msg) =>
+      msg.type === "RequestUserInput" ? msg.event : null,
+    );
+    expect(codex.hasPendingInput(request.turn_id)).toBe(true);
+
+    await codex.submit({ type: "Interrupt" });
+    expect(codex.hasPendingInput(request.turn_id)).toBe(false);
+    const aborted = await waitForEvent(codex, (msg) => msg.type === "TurnAborted");
+    expect(aborted.type === "TurnAborted" && aborted.event.turn_id).toBe(request.turn_id);
+
+    // A late answer finds no resolver: nothing resumes, nothing is sampled.
+    await codex.submit({
+      type: "UserInputAnswer",
+      id: request.turn_id,
+      response: { answers: { confirm_path: { answers: ["yes"] } } },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // The call was recorded as aborted, so the next request has it paired.
+    await codex.submit({ type: "UserInput", items: [{ type: "text", text: "next" }] });
+    await waitForEvent(codex, (msg) => msg.type === "TurnComplete");
+    const outputs = capturedBodies[1]!.input.filter(
+      (item) => item.type === "function_call_output" && item.call_id === callId,
+    );
+    expect(outputs.map((item) => item.output)).toEqual([
+      expect.stringMatching(/^aborted by user after \d+\.\ds$/u),
+    ]);
+  });
+});

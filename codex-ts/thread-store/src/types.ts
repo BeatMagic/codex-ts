@@ -29,6 +29,18 @@ export type UserContentPart =
   /** mirrors ContentItem::InputAudio (models.rs:723) — a base64 data URI. */
   | { type: "input_audio"; audio_url: string };
 
+/**
+ * One part of a structured tool output — the array form of
+ * `function_call_output.output` on the Responses API. mirrors codex-rs
+ * FunctionCallOutputContentItem (models.rs), the payload of
+ * FunctionCallOutputBody::ContentItems. Hosts use it to hand images back to
+ * the model (view_image: `[input_image, input_text]`); a plain string stays the
+ * common case (FunctionCallOutputBody::Text).
+ */
+export type FunctionCallOutputContentItem =
+  | { type: "input_text"; text: string }
+  | { type: "input_image"; image_url: string; detail?: ImageDetail };
+
 export type ConversationItem =
   | {
       type: "message";
@@ -37,7 +49,11 @@ export type ConversationItem =
     }
   | { type: "message"; role: "assistant"; content: string }
   | { type: "function_call"; call_id: string; name: string; arguments: string }
-  | { type: "function_call_output"; call_id: string; output: string };
+  | {
+      type: "function_call_output";
+      call_id: string;
+      output: string | FunctionCallOutputContentItem[];
+    };
 
 // ─── RolloutItem — mirrors codex-rs/protocol/src/protocol.rs RolloutItem ─────
 //
