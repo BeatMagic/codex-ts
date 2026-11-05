@@ -21,6 +21,7 @@ export {
   parseRateLimitRetryAfterMs,
   ResponsesApiError,
 } from "./session/retry.js";
+export { DEFAULT_STREAM_IDLE_TIMEOUT_MS } from "./session/sse.js";
 export {
   ensureCallOutputsPresent,
   normalizeHistory,

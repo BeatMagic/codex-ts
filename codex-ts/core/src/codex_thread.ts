@@ -175,6 +175,12 @@ export interface CodexThreadConfig {
    */
   maxRetries?: number | undefined;
   /**
+   * Longest silence between chunks of a streaming response before it is
+   * abandoned with a retryable "idle timeout waiting for SSE" (mirrors codex-rs
+   * stream_idle_timeout_ms). Defaults to 300_000; zero or negative disables it.
+   */
+  streamIdleTimeoutMs?: number | undefined;
+  /**
    * Overrides the inline-compaction summarization prompt (mirrors codex-rs
    * `config.compact_prompt`, compact.rs:118). Omit for the bundled
    * SUMMARIZATION_PROMPT ported from prompts/templates/compact/prompt.md.
@@ -218,6 +224,7 @@ interface ResolvedConfig {
   autoCompactTokenLimit?: number | undefined;
   contextWindow?: number | undefined;
   maxRetries?: number | undefined;
+  streamIdleTimeoutMs?: number | undefined;
   compactPrompt?: string | undefined;
   compactionRequestParity?: boolean | undefined;
   isContextualUserMessage?: ((text: string) => boolean) | undefined;
@@ -272,6 +279,7 @@ export class CodexThread {
       autoCompactTokenLimit: config.autoCompactTokenLimit,
       contextWindow: config.contextWindow,
       maxRetries: config.maxRetries,
+      streamIdleTimeoutMs: config.streamIdleTimeoutMs,
       compactPrompt: config.compactPrompt,
       compactionRequestParity: config.compactionRequestParity,
       isContextualUserMessage: config.isContextualUserMessage,
@@ -437,6 +445,9 @@ export class CodexThread {
             : {}),
           ...(this.config.maxRetries !== undefined
             ? { maxRetries: this.config.maxRetries }
+            : {}),
+          ...(this.config.streamIdleTimeoutMs !== undefined
+            ? { streamIdleTimeoutMs: this.config.streamIdleTimeoutMs }
             : {}),
           ...(this.config.compactPrompt !== undefined
             ? { compactPrompt: this.config.compactPrompt }
