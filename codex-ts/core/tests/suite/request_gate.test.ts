@@ -360,9 +360,20 @@ describe("compactions queued on the gate", () => {
     });
     await codex.submit({ type: "UserInput", items: [{ type: "text", text: "one" }] });
     await codex.submit({ type: "UserInput", items: [{ type: "text", text: "two" }] });
-    await waitForEvent(codex, (m) => m.type === "TurnComplete");
-    await waitForEvent(codex, (m) => m.type === "TurnComplete");
+    let completed = 0;
+    let compacted = 0;
+    while (completed < 2) {
+      const msg = await waitForEvent(
+        codex,
+        (m) => m.type === "TurnComplete" || m.type === "ContextCompacted",
+      );
+      if (msg.type === "TurnComplete") completed += 1;
+      else compacted += 1;
+    }
+    // History was compacted once…
+    expect(compacted).toBe(1);
 
+    // …by the one summarizer request that was sent.
     const summarizerRequests = bodies.filter((body) =>
       JSON.stringify(body.input[body.input.length - 1]).includes(SUMMARIZATION_PROMPT.slice(0, 30)),
     );
