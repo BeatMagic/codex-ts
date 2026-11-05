@@ -81,7 +81,7 @@ describe("retry helpers", () => {
     for (const status of [408, 409, 429, 500, 502, 503, 504]) {
       expect(isRetryableStatus(status)).toBe(true);
     }
-    for (const status of [200, 400, 401, 403, 404, 422]) {
+    for (const status of [200, 400, 401, 403, 404, 422, 501]) {
       expect(isRetryableStatus(status)).toBe(false);
     }
   });

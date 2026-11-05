@@ -315,6 +315,21 @@ describe("HTTP failure classification", () => {
 });
 
 describe("classification inside a turn", () => {
+  // Deliberate deviation from rs (which retries every 5xx): the ace-mv cloud
+  // remaps an upstream provider's 402 to 501 so the client fails fast.
+  it("does not re-send a 501", async () => {
+    expect(isRetryableError(classifyHttpFailure(501, "{}", new Headers()))).toBe(false);
+    const fetchMock = vi.fn().mockResolvedValue(
+      httpError(501, {
+        error: { code: 402, message: "This request requires more credits" },
+      }),
+    );
+    const { done } = startTurn(fetchMock);
+    const error = await done.catch((e: unknown) => e);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(codexErrorInfoFor(error)).toEqual({ type: "other" });
+  });
+
   it("does not re-send a 429 quota error", async () => {
     const fetchMock = vi
       .fn()

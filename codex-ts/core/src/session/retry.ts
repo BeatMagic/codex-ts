@@ -76,9 +76,20 @@ export class ResponsesApiError extends Error {
  * Whether an HTTP status is a transient failure worth retrying. Mirrors the
  * retryable set in codex-rs (timeouts / 5xx / unexpected status); 4xx are
  * terminal except 408 (request timeout), 409 (conflict) and 429 (rate limit).
+ *
+ * Deliberate deviation: 501 is terminal, although rs retries every 5xx. Not
+ * Implemented is permanent by HTTP semantics, and the ace-mv cloud remaps an
+ * upstream provider's 402 (a persistent billing / config error) to 501
+ * precisely so the client fails fast (UPSTREAM_PROVIDER_ERROR_STATUS in
+ * cloud responses-proxy/index.ts); retrying re-hits the dead upstream.
  */
 export function isRetryableStatus(status: number): boolean {
-  return status === 408 || status === 409 || status === 429 || status >= 500;
+  return (
+    status === 408 ||
+    status === 409 ||
+    status === 429 ||
+    (status >= 500 && status !== 501)
+  );
 }
 
 // mirrors codex-api/src/sse/responses.rs is_context_window_error — codex-rs only
