@@ -39,24 +39,36 @@ export function backoff(attempt: number): number {
  * would normally look transient — mirrors codex-rs mapping certain
  * `response.failed` payload codes to non-retryable CodexErr variants
  * (`insufficient_quota`, `cyber_policy`, `invalid_prompt`, `server_is_overloaded`…
- * see CodexErr::is_retryable, protocol/src/error.rs:358).
+ * see CodexErr::retry_delay, protocol/src/error.rs).
  */
 export class ResponsesApiError extends Error {
   readonly status: number;
   readonly retryAfterMs: number | undefined;
   readonly terminal: boolean;
+  /** The provider error code the failure was classified from (HTTP body
+   *  `error.code`, `response.error.code`, an `error` frame's code), or a
+   *  `response.incomplete`'s reason. */
+  readonly code: string | undefined;
+  /** Monotonic instant (performance.now()) the server's retry advice runs out.
+   *  Captured when the advice arrives, so the time spent before the retry
+   *  sleeps counts against it — mirrors RetryAfter's deadline (#47641). */
+  readonly retryAt: number | undefined;
 
   constructor(
     status: number,
     body: string,
     retryAfterMs?: number | undefined,
     terminal = false,
+    code?: string | undefined,
   ) {
     super(`Responses API ${status}: ${body}`);
     this.name = "ResponsesApiError";
     this.status = status;
     this.retryAfterMs = retryAfterMs;
     this.terminal = terminal;
+    this.code = code;
+    this.retryAt =
+      retryAfterMs === undefined ? undefined : performance.now() + retryAfterMs;
   }
 }
 
@@ -109,10 +121,11 @@ export function isContextWindowExceededError(error: unknown): boolean {
 
 /**
  * Classify a thrown error as retryable. Aborts (interrupts) are terminal; an
- * explicitly terminal ResponsesApiError (see classifyStreamFailure) is never
- * retried; otherwise ResponsesApiError defers to its status, and anything else
- * (network TypeError, dropped stream, JSON/IO error) is treated as a transient
- * connection failure — mirrors codex-rs CodexErr::is_retryable
+ * explicitly terminal ResponsesApiError (see classifyStreamFailure /
+ * classifyHttpFailure) is never retried; otherwise ResponsesApiError defers to
+ * its status, and anything else (network TypeError, dropped stream, JSON/IO
+ * error) is treated as a transient connection failure — mirrors codex-rs
+ * CodexErr::is_retryable
  * (ConnectionFailed / Stream / Io / UnexpectedStatus → true).
  */
 export function isRetryableError(error: unknown): boolean {
@@ -128,27 +141,96 @@ export function isRetryableError(error: unknown): boolean {
 // ─── SSE terminal-event classification (mirrors codex-api sse/responses.rs) ────
 
 /**
- * Error codes that make a `response.failed` event terminal.
- * mirrors process_responses_event's `response.failed` arm
- * (codex-api/src/sse/responses.rs:387): each of these maps to a CodexErr that
- * `is_retryable()` rejects, so re-sending the identical request cannot help.
- *   - insufficient_quota  → CodexErr::QuotaExceeded
+ * Error codes that make a `response.failed` event (or an `error` frame)
+ * terminal. mirrors parse_failed_response (codex-api/src/sse/
+ * responses_error.rs) + parse_terminal_provider_error (codex-api/src/error.rs):
+ * each maps to a CodexErr whose `retry_delay()` is None, so re-sending the
+ * identical request cannot help.
+ *   - insufficient_quota / credit_balance_exhausted /
+ *     organization_spend_limit_exceeded / project_spend_limit_exceeded
+ *     → CodexErr::QuotaExceeded (#45602); organization_usage_limit_exceeded
+ *     is in rs's HTTP 429 list (#44492) and treated alike here
  *   - usage_not_included  → CodexErr::UsageNotIncluded
  *   - cyber_policy        → CodexErr::CyberPolicy
- *   - invalid_prompt / bio_policy → CodexErr::InvalidRequest
- *   - server_is_overloaded / slow_down → CodexErr::ServerOverloaded
+ *   - invalid_prompt / bio_policy → CodexErr::InvalidPrompt / BioPolicy
+ *   - model_not_found     → CodexErr::ModelNotFound (#56445)
+ *   - server_is_overloaded → CodexErr::ServerOverloaded — terminal only while
+ *     the server gives no retry advice (see RETRYABLE_WITH_ADVICE_CODES)
+ * `slow_down` is NOT here: #45602 made it a retryable rate limit.
  * (context_length_exceeded is terminal too, but is handled separately because
  * it also drives compaction / the self-heal path.)
  */
 const TERMINAL_STREAM_FAILURE_CODES = new Set<string>([
   "insufficient_quota",
+  "credit_balance_exhausted",
+  "organization_spend_limit_exceeded",
+  "project_spend_limit_exceeded",
+  "organization_usage_limit_exceeded",
   "usage_not_included",
   "cyber_policy",
   "invalid_prompt",
   "bio_policy",
+  "model_not_found",
   "server_is_overloaded",
-  "slow_down",
 ]);
+
+/**
+ * Terminal codes that become retryable when the server says when to retry:
+ * rs retries ServerOverloaded only via `server_retry_delay()` (#49441), and
+ * only from a Retry-After header, never from message text. The ace-mv cloud's
+ * keepalive-stall frame (`server_is_overloaded`, no headers) stays terminal.
+ */
+const RETRYABLE_WITH_ADVICE_CODES = new Set<string>(["server_is_overloaded"]);
+
+/** Quota / usage-limit signals in an HTTP 429 body: `error.code` values and
+ *  `error.type` values. mirrors map_api_error's TOO_MANY_REQUESTS arm
+ *  (codex-api/src/api_bridge.rs, #44492) — UsageLimitReached, UsageNotIncluded
+ *  and QuotaExceeded are all terminal. */
+const HTTP_429_QUOTA_CODES = new Set<string>([
+  "insufficient_quota",
+  "credit_balance_exhausted",
+  "organization_spend_limit_exceeded",
+  "project_spend_limit_exceeded",
+  "organization_usage_limit_exceeded",
+]);
+const HTTP_429_QUOTA_TYPES = new Set<string>([
+  "usage_limit_reached",
+  "usage_not_included",
+  "insufficient_quota",
+]);
+
+/** Rate-limit codes: retryable, and the only ones whose message's
+ *  "try again in Xs" counts as retry advice (#45602 added slow_down). */
+const RATE_LIMIT_CODES = new Set<string>(["rate_limit_exceeded", "slow_down"]);
+
+/**
+ * Longest server-advised delay honored before a retry. rs sleeps until the
+ * deadline however far away; here one large Retry-After would park the turn
+ * (and the compaction that blocks it) for its whole duration. 60s matches the
+ * clamp the ace-mv host's fetch retry (RETRY_AFTER_MAX_MS) and the cloud's
+ * same-leg retry already apply, so no layer waits longer than another; with
+ * the default budget a turn waits at most maxRetries × 60s.
+ */
+export const MAX_RETRY_AFTER_MS = 60_000;
+
+/**
+ * Appended to the retried request after a `content_filter` incomplete, so the
+ * retry is not byte-identical to the blocked one. Text verbatim from
+ * CONTENT_FILTER_GUIDANCE (codex-rs/prompts/src/model_messages.rs, #49119).
+ */
+export const CONTENT_FILTER_GUIDANCE =
+  "Your previous response was blocked by a content filter. Do not treat this " +
+  "as a transient failure or try to reproduce or work around the blocked " +
+  "content through repeated attempts, altered formatting, splitting, " +
+  "encoding, tools, subagents, or later wakes. Briefly explain the " +
+  "limitation and offer a permitted alternative. Continue unrelated " +
+  "authorized work.";
+
+/** A `content_filter` incomplete — retryable, but the retry needs
+ *  CONTENT_FILTER_GUIDANCE (rs CodexErrorDetails::ContentFilter). */
+export function isContentFilterError(error: unknown): boolean {
+  return error instanceof ResponsesApiError && error.code === "content_filter";
+}
 
 /**
  * `response.incomplete` reasons that make the incomplete TERMINAL.
@@ -179,14 +261,14 @@ const RATE_LIMIT_RETRY_AFTER_RE =
 
 /**
  * Parse a provider "…please try again in 11.054s" hint into milliseconds.
- * mirrors try_parse_retry_after (codex-api/src/sse/responses.rs:599), which only
- * honors the hint for `rate_limit_exceeded`.
+ * mirrors try_parse_retry_delay (codex-api/src/sse/responses_error.rs), which
+ * only honors the hint for the rate-limit codes.
  */
 export function parseRateLimitRetryAfterMs(
   code: string | undefined,
   message: string | undefined,
 ): number | undefined {
-  if (code !== "rate_limit_exceeded" || !message) {
+  if (code === undefined || !RATE_LIMIT_CODES.has(code) || !message) {
     return undefined;
   }
   const match = RATE_LIMIT_RETRY_AFTER_RE.exec(message);
@@ -208,8 +290,10 @@ export function parseRateLimitRetryAfterMs(
  *
  * mirrors process_responses_event (codex-api/src/sse/responses.rs:387-431):
  *   - `response.failed` inspects `response.error.code` and maps it to a
- *     terminal or retryable CodexErr, honoring a "try again in Xs" delay for
- *     rate limits (everything unrecognised stays Retryable, like rs);
+ *     terminal or retryable CodexErr (everything unrecognised stays
+ *     Retryable, like rs). Retry advice comes from a Retry-After in
+ *     `response.error.headers` (#50418), else — for rate limits only — from a
+ *     "try again in Xs" in the message;
  *   - `response.incomplete` carries the `incomplete_details.reason`; it is
  *     terminal only for the output cap (see TERMINAL_INCOMPLETE_REASONS),
  *     otherwise a retryable CodexErr::Stream;
@@ -238,6 +322,7 @@ export function classifyStreamFailure(raw: Record<string, unknown>): ResponsesAp
       `Incomplete response returned, reason: ${reason}`,
       undefined,
       TERMINAL_INCOMPLETE_REASONS.has(reason),
+      reason,
     );
   }
 
@@ -253,9 +338,72 @@ export function classifyStreamFailure(raw: Record<string, unknown>): ResponsesAp
     typeof error?.["message"] === "string" ? error["message"] : undefined;
   const body = error !== undefined ? JSON.stringify(error) : JSON.stringify(raw);
 
-  const terminal = code !== undefined && TERMINAL_STREAM_FAILURE_CODES.has(code);
-  const retryAfterMs = parseRateLimitRetryAfterMs(code, message);
-  return new ResponsesApiError(503, body, retryAfterMs, terminal);
+  // A valid header wins over the message hint (#50418).
+  const headerRetryAfterMs = retryAfterFromErrorHeaders(error?.["headers"]);
+  const retryAfterMs =
+    headerRetryAfterMs ?? parseRateLimitRetryAfterMs(code, message);
+  const terminal =
+    code !== undefined &&
+    TERMINAL_STREAM_FAILURE_CODES.has(code) &&
+    !(RETRYABLE_WITH_ADVICE_CODES.has(code) && headerRetryAfterMs !== undefined);
+  return new ResponsesApiError(503, body, retryAfterMs, terminal, code);
+}
+
+/** Retry-After from a streamed error's `headers` object (header names are
+ *  case-insensitive; string or number values). mirrors
+ *  json_headers_to_http_headers + RetryAfter::from_headers. */
+function retryAfterFromErrorHeaders(headers: unknown): number | undefined {
+  if (typeof headers !== "object" || headers === null) return undefined;
+  for (const [name, value] of Object.entries(headers)) {
+    if (name.toLowerCase() !== "retry-after") continue;
+    if (typeof value === "string" || typeof value === "number") {
+      return parseRetryAfterValue(String(value));
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Turn a non-2xx Responses reply into a ResponsesApiError with rs's verdict
+ * (map_api_error, codex-api/src/api_bridge.rs). Status decides by default
+ * (isRetryableStatus); the body's `error.code` / `error.type` refine it:
+ *   - 429 carrying a quota or usage-limit signal is terminal (#44492);
+ *   - any other 429 is rs's RetryLimit, and a 503 `server_is_overloaded` its
+ *     ServerOverloaded: both retry only with server advice, i.e. a
+ *     Retry-After header (#49441) — without one, re-sending just presses on
+ *     a limiter that gave no sign of when it lifts;
+ *   - a 503 `slow_down` stays retryable (#45602: a rate limit, not an
+ *     overload).
+ * `model_not_found` needs no rule: rs reads it from 400/403/404, all terminal
+ * by status already.
+ */
+export function classifyHttpFailure(
+  status: number,
+  body: string,
+  headers: Headers,
+): ResponsesApiError {
+  const retryAfterMs = parseRetryAfter(headers);
+  let code: string | undefined;
+  let type: string | undefined;
+  try {
+    const error = (JSON.parse(body) as Record<string, unknown> | null)?.[
+      "error"
+    ] as Record<string, unknown> | undefined;
+    if (typeof error?.["code"] === "string") code = error["code"];
+    if (typeof error?.["type"] === "string") type = error["type"];
+  } catch {
+    /* not a JSON error envelope — status alone decides */
+  }
+  let terminal = false;
+  if (status === 429) {
+    terminal =
+      (code !== undefined && HTTP_429_QUOTA_CODES.has(code)) ||
+      (type !== undefined && HTTP_429_QUOTA_TYPES.has(type)) ||
+      retryAfterMs === undefined;
+  } else if (status === 503 && code === "server_is_overloaded") {
+    terminal = retryAfterMs === undefined;
+  }
+  return new ResponsesApiError(status, body, retryAfterMs, terminal, code);
 }
 
 export function isAbortError(error: unknown): boolean {
@@ -267,16 +415,14 @@ export function isAbortError(error: unknown): boolean {
 }
 
 /**
- * Delay before the next attempt: honor a server Retry-After when the error
- * carries one (e.g. 429), otherwise exponential backoff.
+ * Delay before the next attempt: what is left of the server's advice when the
+ * error carries some — expired advice is zero, not a fallback to backoff
+ * (#47641) — capped at MAX_RETRY_AFTER_MS; otherwise exponential backoff.
  */
 export function computeRetryDelay(error: unknown, attempt: number): number {
-  if (
-    error instanceof ResponsesApiError &&
-    error.retryAfterMs !== undefined &&
-    error.retryAfterMs >= 0
-  ) {
-    return error.retryAfterMs;
+  if (error instanceof ResponsesApiError && error.retryAt !== undefined) {
+    const remaining = Math.ceil(error.retryAt - performance.now());
+    return Math.min(MAX_RETRY_AFTER_MS, Math.max(0, remaining));
   }
   return backoff(attempt);
 }
@@ -288,6 +434,14 @@ export function computeRetryDelay(error: unknown, attempt: number): number {
 export function parseRetryAfter(headers: Headers): number | undefined {
   const raw = headers.get("retry-after");
   if (!raw) {
+    return undefined;
+  }
+  return parseRetryAfterValue(raw);
+}
+
+/** A Retry-After value (delta-seconds or HTTP-date) in milliseconds. */
+function parseRetryAfterValue(raw: string): number | undefined {
+  if (raw.trim() === "") {
     return undefined;
   }
   const seconds = Number(raw);
@@ -331,20 +485,33 @@ export function codexErrorInfoFor(
   // has the response body, so probe it for the same identifiers.
   const message = error.message;
   const has = (needle: string): boolean => message.includes(needle);
+  // #56445: ModelNotFound from 400/403/404 bodies and streamed failures.
+  if (has("model_not_found")) {
+    return { type: "model_not_found" };
+  }
   if (has("cyber_policy")) {
     return { type: "cyber_policy" };
   }
-  if (has("server_is_overloaded") || has("slow_down")) {
+  if (has("server_is_overloaded")) {
     return { type: "server_overloaded" };
   }
   // QuotaExceeded | UsageNotIncluded | UsageLimitReached all collapse into
-  // UsageLimitExceeded (error.rs:419).
+  // UsageLimitExceeded (error.rs to_codex_protocol_error); the spend-limit
+  // codes are QuotaExceeded since #44492 / #45602.
   if (
     has("insufficient_quota") ||
+    has("credit_balance_exhausted") ||
+    has("spend_limit_exceeded") ||
+    has("organization_usage_limit_exceeded") ||
     has("usage_not_included") ||
     has("usage_limit_reached")
   ) {
     return { type: "usage_limit_exceeded" };
+  }
+  // A streamed rate limit, or an HTTP 503 `slow_down`, is
+  // CodexErr::RateLimitExceeded (#45602); an HTTP 429 stays RetryLimit below.
+  if (error.status !== 429 && (has("rate_limit_exceeded") || has("slow_down"))) {
+    return { type: "rate_limit_exceeded" };
   }
 
   switch (error.status) {

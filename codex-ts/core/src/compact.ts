@@ -15,12 +15,12 @@ import {
   parseSseStream,
 } from "./session/sse.js";
 import {
+  classifyHttpFailure,
   classifyStreamFailure,
   computeRetryDelay,
   DEFAULT_MAX_RETRIES,
   isContextWindowExceededError,
   isRetryableError,
-  parseRetryAfter,
   ResponsesApiError,
   sleep,
 } from "./session/retry.js";
@@ -326,11 +326,7 @@ export async function runInlineAutoCompactTask(
 
       if (!res.ok || !res.body) {
         const text = res.body ? await res.text() : "(no body)";
-        throw new ResponsesApiError(
-          res.status,
-          text,
-          parseRetryAfter(res.headers),
-        );
+        throw classifyHttpFailure(res.status, text, res.headers);
       }
 
       // Collect the assistant's summary text from the stream

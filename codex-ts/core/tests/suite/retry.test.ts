@@ -101,9 +101,10 @@ describe("retry helpers", () => {
   });
 
   it("computeRetryDelay honors Retry-After, else backs off", () => {
-    expect(computeRetryDelay(new ResponsesApiError(429, "x", 1500), 1)).toBe(
-      1500,
-    );
+    // What is LEFT of the advice: it counts down from when the error was built.
+    const delay = computeRetryDelay(new ResponsesApiError(429, "x", 1500), 1);
+    expect(delay).toBeLessThanOrEqual(1500);
+    expect(delay).toBeGreaterThan(1400);
     const d = computeRetryDelay(new TypeError("net"), 1);
     expect(d).toBeGreaterThanOrEqual(180);
     expect(d).toBeLessThanOrEqual(220);

@@ -10,7 +10,9 @@ export type {
 export type { StepStatus, PlanItemArg, UpdatePlanArgs } from "./plan_tool.js";
 export type {
   ContextCompactedEvent,
+  AgentMessageContentResetEvent,
   FunctionCallStreamArgsEvent,
+  FunctionCallStreamResetEvent,
   FunctionCallStreamStartEvent,
   WarningEvent,
 } from "./protocol.js";

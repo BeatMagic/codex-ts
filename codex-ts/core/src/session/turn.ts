@@ -36,12 +36,14 @@ import {
   parseSseStream,
 } from "./sse.js";
 import {
+  classifyHttpFailure,
   classifyStreamFailure,
   computeRetryDelay,
+  CONTENT_FILTER_GUIDANCE,
   DEFAULT_MAX_RETRIES,
+  isContentFilterError,
   isContextWindowExceededError,
   isRetryableError,
-  parseRetryAfter,
   ResponsesApiError,
   sleep,
 } from "./retry.js";
@@ -138,6 +140,15 @@ export interface TurnConfig {
    * DEFAULT_STREAM_IDLE_TIMEOUT_MS (300_000); zero or negative disables it.
    */
   streamIdleTimeoutMs?: number | undefined;
+  /**
+   * Also retry a transient failure that happens AFTER visible text streamed
+   * (same maxRetries budget). The partial text is withdrawn with
+   * AgentMessageContentReset and the retry streams under the same item_id;
+   * nothing from the failed attempt is persisted. Off by default: without it
+   * such a failure ends the turn, because a host that does not handle the
+   * reset would show the text twice.
+   */
+  retryAfterVisibleOutput?: boolean | undefined;
   /**
    * Overrides the inline-compaction summarization prompt. mirrors
    * `config.compact_prompt` (compact.rs:118-123) — omit to use the bundled
@@ -668,16 +679,24 @@ export async function runTurn(
 
     // ── Sample from the model (retry transient failures) ────────────────────
     // mirrors codex-rs's stream retry loop (responses_retry.rs): a network
-    // error / 5xx / 429 / dropped stream is retried with exponential backoff.
+    // error / 5xx / dropped stream is retried with exponential backoff, a 429
+    // or an overload only with server advice (see classifyHttpFailure).
     // Unlike codex-rs (which re-streams in place into a TUI) codex-ts emits
     // deltas live, so we only retry while NO visible output has streamed yet —
-    // re-streaming after that would duplicate text downstream.
+    // re-streaming after that would duplicate text downstream — unless the
+    // host opted into retryAfterVisibleOutput and handles the reset events.
     const functionCalls: { call_id: string; name: string; arguments: string }[] =
       [];
     let assistantText = "";
     let currentItemId = `item-${++itemIdCounter}`;
     let inputTokensThisRound = 0;
     let retryAttempt = 0;
+    // Item ids whose text a failed attempt streamed and a retry withdrew; the
+    // next attempt streams its message items under them, in order.
+    let resetItemIds: string[] = [];
+    // Set once an attempt was stopped by the content filter: every later
+    // attempt of this round carries the recovery guidance (see below).
+    let withContentFilterGuidance = false;
 
     for (;;) {
       // A retry re-streams from scratch → reset per-attempt accumulators.
@@ -693,6 +712,51 @@ export async function runTurn(
       // Message items that streamed output_text deltas — their completed
       // item's text must not be counted again. See output_item.done.
       const streamedMessageIds = new Set<string>();
+      // What this attempt showed the host, so a retry can withdraw it: item
+      // ids its text streamed under, and the calls it announced.
+      const shownItemIds: string[] = [];
+      const announcedCallIds: string[] = [];
+      // The id a message item's text is shown under: a withdrawn id from the
+      // previous attempt when one is left, else the item's own.
+      const reusableItemIds = [...resetItemIds];
+      const shownIdFor = new Map<string, string>();
+      const displayItemId = (itemId: string): string => {
+        let shown = shownIdFor.get(itemId);
+        if (shown === undefined) {
+          shown = reusableItemIds.shift() ?? itemId;
+          shownIdFor.set(itemId, shown);
+          shownItemIds.push(shown);
+        }
+        return shown;
+      };
+      // After a content_filter stop the retry must not be byte-identical to
+      // the blocked request: append rs's recovery guidance (#49119 / #49130).
+      // rs records it in history as a developer message; here it rides on
+      // this round's retries only — never persisted, so the host never shows
+      // it — and as a trailing USER item: every brain leg hoists
+      // developer/system items into the system prompt, which would change the
+      // cached prefix and cost a full-context cache miss.
+      const requestBody: Record<string, unknown> = withContentFilterGuidance
+        ? {
+            ...body,
+            input: [
+              ...(body["input"] as HistoryItem[]),
+              {
+                type: "message",
+                role: "user",
+                content: [
+                  {
+                    type: "input_text",
+                    text:
+                      "<content_filter_guidance>\n" +
+                      CONTENT_FILTER_GUIDANCE +
+                      "\n</content_filter_guidance>",
+                  },
+                ],
+              },
+            ],
+          }
+        : body;
       // The compaction generation this request's history was built under.
       // Concurrent turns share the session: if another turn compacted while
       // this request was in flight, its usage measures a history that no
@@ -716,18 +780,14 @@ export async function runTurn(
               "Content-Type": "application/json",
               Authorization: `Bearer ${config.apiKey}`,
             },
-            body: JSON.stringify(body),
+            body: JSON.stringify(requestBody),
             signal: abortSignal ?? null,
           },
         );
 
         if (!res.ok || !res.body) {
           const text = res.body ? await res.text() : "(no body)";
-          throw new ResponsesApiError(
-            res.status,
-            text,
-            parseRetryAfter(res.headers),
-          );
+          throw classifyHttpFailure(res.status, text, res.headers);
         }
 
         // ── Parse SSE stream ──────────────────────────────────────────────
@@ -749,10 +809,14 @@ export async function runTurn(
                 // the in-progress tool during composition instead of a blank
                 // spinner. DISPLAY ONLY: the dispatched arguments still come
                 // solely from output_item.done (see the rule at that arm).
+                const callStreamId = String(
+                  item["id"] ?? item["call_id"] ?? "",
+                );
+                announcedCallIds.push(callStreamId);
                 emitEvent({
                   type: "FunctionCallStreamStart",
                   event: {
-                    id: String(item["id"] ?? item["call_id"] ?? ""),
+                    id: callStreamId,
                     name: String(item["name"] ?? ""),
                     turn_id: turnId,
                   },
@@ -769,7 +833,11 @@ export async function runTurn(
               emittedOutput = true;
               emitEvent({
                 type: "AgentMessageContentDelta",
-                event: { turn_id: turnId, item_id: currentItemId, delta },
+                event: {
+                  turn_id: turnId,
+                  item_id: displayItemId(currentItemId),
+                  delta,
+                },
               });
               break;
             }
@@ -849,7 +917,11 @@ export async function runTurn(
                     emittedOutput = true;
                     emitEvent({
                       type: "AgentMessageContentDelta",
-                      event: { turn_id: turnId, item_id: doneId, delta: text },
+                      event: {
+                        turn_id: turnId,
+                        item_id: displayItemId(doneId),
+                        delta: text,
+                      },
                     });
                   }
                 }
@@ -1015,16 +1087,35 @@ export async function runTurn(
           markContextFull(config, tokenState, emitEvent, liveThread);
           throw err;
         }
-        // Stop retrying once visible output streamed (would duplicate), the
-        // budget is spent, or the error is not transient.
+        // Stop retrying once visible output streamed (would duplicate, unless
+        // the host opted in), the budget is spent, or the error is not
+        // transient.
         if (
-          emittedOutput ||
+          (emittedOutput && !config.retryAfterVisibleOutput) ||
           retryAttempt >= maxRetries ||
           !isRetryableError(err)
         ) {
           throw err;
         }
         retryAttempt += 1;
+        // The retry streams from scratch: withdraw what this attempt showed.
+        // Its text items are reset and their ids handed to the next attempt
+        // (with any withdrawn ids this attempt never reused), and every call
+        // it announced is abandoned — it is never dispatched.
+        for (const itemId of shownItemIds) {
+          emitEvent({
+            type: "AgentMessageContentReset",
+            event: { turn_id: turnId, item_id: itemId },
+          });
+        }
+        for (const id of announcedCallIds) {
+          emitEvent({
+            type: "FunctionCallStreamReset",
+            event: { turn_id: turnId, id },
+          });
+        }
+        resetItemIds = [...shownItemIds, ...reusableItemIds];
+        if (isContentFilterError(err)) withContentFilterGuidance = true;
         emitEvent({
           type: "Warning",
           event: { message: `Reconnecting... ${retryAttempt}/${maxRetries}` },
