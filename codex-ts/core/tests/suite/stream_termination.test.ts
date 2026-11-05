@@ -609,6 +609,33 @@ describe("compaction summarizer stream", () => {
     );
   });
 
+  // With the sampling request's tools (parity body), an empty summary switches
+  // to the legacy body; a done-only summary is not empty, so no switch.
+  it("a done-only summary in the parity body needs no legacy fallback", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const fetchMock = vi.fn().mockResolvedValue(
+        sseResponse([
+          sseFlat([evResponseCreated("c"), evDoneOnlyMessage("s1", "parity summary"), evCompleted("c")]),
+        ]),
+      );
+      expect(
+        await runInlineAutoCompactTask(history(), {
+          ...compactConfig(fetchMock, { maxRetries: 0 }),
+          tools: [],
+        }),
+      ).toBe("parity summary");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const body = JSON.parse(
+        (fetchMock.mock.calls[0]![1] as RequestInit).body as string,
+      ) as Record<string, unknown>;
+      expect(body).toHaveProperty("tools");
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("cancels a held-open body once completed arrives", async () => {
     const onCancel = vi.fn();
     const fetchMock = vi.fn().mockResolvedValue(
