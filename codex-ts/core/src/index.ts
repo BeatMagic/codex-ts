@@ -14,10 +14,14 @@ export {
 } from "./state/token_state.js";
 export type { RecomputeTokenUsageParams } from "./state/token_state.js";
 export {
+  classifyHttpFailure,
   classifyStreamFailure,
   codexErrorInfoFor,
+  CONTENT_FILTER_GUIDANCE,
+  isContentFilterError,
   isContextWindowExceededError,
   isContextWindowExceededText,
+  MAX_RETRY_AFTER_MS,
   parseRateLimitRetryAfterMs,
   ResponsesApiError,
 } from "./session/retry.js";

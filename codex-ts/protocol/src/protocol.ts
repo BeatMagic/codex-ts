@@ -146,7 +146,9 @@ export type CodexErrorInfo =
   | { type: "context_window_exceeded" }
   | { type: "session_budget_exceeded" }
   | { type: "usage_limit_exceeded" }
+  | { type: "rate_limit_exceeded" }
   | { type: "server_overloaded" }
+  | { type: "model_not_found" }
   | { type: "cyber_policy" }
   | { type: "http_connection_failed"; http_status_code?: number | undefined }
   | {
@@ -248,6 +250,36 @@ export interface FunctionCallStreamArgsEvent {
   delta: string;
 }
 
+/**
+ * The call announced by FunctionCallStreamStart `id` was abandoned: the
+ * sampling attempt it streamed in failed and is being retried, so it will
+ * never be dispatched. Drop any display state kept for that id. The retry
+ * may announce the same call again, under the same or a new id.
+ */
+export interface FunctionCallStreamResetEvent {
+  turn_id: string;
+  id: string;
+}
+
+// ─── Retry after visible output (TurnConfig.retryAfterVisibleOutput) ──────────
+//
+// No equivalent in codex-rs/protocol: rs records completed items as they
+// stream and resamples from them, so it never takes text back. codex-ts
+// persists nothing from a failed attempt, so when it retries after text was
+// already shown, that text must be withdrawn from the host.
+
+/**
+ * The text streamed so far into `item_id` is withdrawn: the attempt that
+ * produced it failed and is being retried. Clear the item's content (keep the
+ * bubble). The retried attempt streams its text under the SAME item_id, so a
+ * host that ignores this event still ends right once the final AgentMessage
+ * replaces the active bubble's text.
+ */
+export interface AgentMessageContentResetEvent {
+  turn_id: string;
+  item_id: string;
+}
+
 export type EventMsg =
   | { type: "TurnStarted"; event: TurnStartedEvent }
   | { type: "TurnComplete"; event: TurnCompleteEvent }
@@ -255,6 +287,8 @@ export type EventMsg =
   | { type: "TurnAborted"; event: TurnAbortedEvent }
   | { type: "AgentMessage"; event: AgentMessageEvent }
   | { type: "AgentMessageContentDelta"; event: AgentMessageContentDeltaEvent }
+  /** Browser-specific: streamed text of an item withdrawn before a retry. */
+  | { type: "AgentMessageContentReset"; event: AgentMessageContentResetEvent }
   | { type: "ReasoningContentDelta"; event: ReasoningContentDeltaEvent }
   | { type: "RequestUserInput"; event: RequestUserInputEvent }
   | { type: "ThreadGoalUpdated"; event: ThreadGoalUpdatedEvent }
@@ -271,6 +305,8 @@ export type EventMsg =
   | { type: "FunctionCallStreamStart"; event: FunctionCallStreamStartEvent }
   /** Browser-specific: one `arguments` delta of a streaming call (display only). */
   | { type: "FunctionCallStreamArgs"; event: FunctionCallStreamArgsEvent }
+  /** Browser-specific: a streamed call abandoned by a retry (display only). */
+  | { type: "FunctionCallStreamReset"; event: FunctionCallStreamResetEvent }
   | { type: "Error"; event: ErrorEvent };
 
 /** Wraps EventMsg with the submission_id that originated it — mirrors codex-rs Event */

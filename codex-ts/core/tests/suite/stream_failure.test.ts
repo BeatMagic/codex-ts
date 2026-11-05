@@ -73,14 +73,20 @@ describe("classifyStreamFailure", () => {
     // Exactly the codes rs's `response.failed` arm maps to non-retryable
     // CodexErr variants. `usage_limit_reached` is NOT here — rs classifies that
     // one on the HTTP 429 path (api_bridge.rs:96), not from an SSE payload.
+    // `slow_down` left this list in #45602 (a retryable rate limit now);
+    // `server_is_overloaded` is terminal only without retry advice.
     for (const code of [
       "insufficient_quota",
+      "credit_balance_exhausted",
+      "organization_spend_limit_exceeded",
+      "project_spend_limit_exceeded",
+      "organization_usage_limit_exceeded",
       "usage_not_included",
       "cyber_policy",
       "invalid_prompt",
       "bio_policy",
+      "model_not_found",
       "server_is_overloaded",
-      "slow_down",
     ]) {
       const err = classifyStreamFailure({
         type: "response.failed",

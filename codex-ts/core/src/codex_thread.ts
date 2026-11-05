@@ -183,6 +183,12 @@ export interface CodexThreadConfig {
    */
   streamIdleTimeoutMs?: number | undefined;
   /**
+   * Retry a transient failure even after visible text streamed, withdrawing
+   * the partial text with AgentMessageContentReset first. Off by default; see
+   * TurnConfig.retryAfterVisibleOutput for the event contract.
+   */
+  retryAfterVisibleOutput?: boolean | undefined;
+  /**
    * Overrides the inline-compaction summarization prompt (mirrors codex-rs
    * `config.compact_prompt`, compact.rs:118). Omit for the bundled
    * SUMMARIZATION_PROMPT ported from prompts/templates/compact/prompt.md.
@@ -227,6 +233,7 @@ interface ResolvedConfig {
   contextWindow?: number | undefined;
   maxRetries?: number | undefined;
   streamIdleTimeoutMs?: number | undefined;
+  retryAfterVisibleOutput?: boolean | undefined;
   compactPrompt?: string | undefined;
   compactionRequestParity?: boolean | undefined;
   isContextualUserMessage?: ((text: string) => boolean) | undefined;
@@ -285,6 +292,7 @@ export class CodexThread {
       contextWindow: config.contextWindow,
       maxRetries: config.maxRetries,
       streamIdleTimeoutMs: config.streamIdleTimeoutMs,
+      retryAfterVisibleOutput: config.retryAfterVisibleOutput,
       compactPrompt: config.compactPrompt,
       compactionRequestParity: config.compactionRequestParity,
       isContextualUserMessage: config.isContextualUserMessage,
@@ -464,6 +472,9 @@ export class CodexThread {
             : {}),
           ...(this.config.streamIdleTimeoutMs !== undefined
             ? { streamIdleTimeoutMs: this.config.streamIdleTimeoutMs }
+            : {}),
+          ...(this.config.retryAfterVisibleOutput !== undefined
+            ? { retryAfterVisibleOutput: this.config.retryAfterVisibleOutput }
             : {}),
           ...(this.config.compactPrompt !== undefined
             ? { compactPrompt: this.config.compactPrompt }
