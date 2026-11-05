@@ -9,7 +9,11 @@
 
 import type { ConversationItem } from "../../thread-store/src/types.js";
 import type { TurnConfig } from "./session/turn.js";
-import { parseSseStream } from "./session/sse.js";
+import {
+  DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+  messageOutputText,
+  parseSseStream,
+} from "./session/sse.js";
 import {
   classifyStreamFailure,
   computeRetryDelay,
@@ -316,27 +320,44 @@ export async function runInlineAutoCompactTask(
       summaryText = "";
       let sawCompleted = false;
       let sawToolCall = false;
-      for await (const raw of parseSseStream(res.body)) {
+      let sawSummaryDelta = false;
+      for await (const raw of parseSseStream(res.body, {
+        idleTimeoutMs:
+          config.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+      })) {
         if (raw["type"] === "response.output_text.delta") {
           summaryText += String(raw["delta"] ?? "");
+          sawSummaryDelta = true;
         } else if (
           raw["type"] === "response.output_item.added" ||
           raw["type"] === "response.output_item.done"
         ) {
           const item = raw["item"] as Record<string, unknown> | undefined;
           if (item?.["type"] === "function_call") sawToolCall = true;
+          // A summarizer whose text arrives only in the completed message
+          // item (no deltas) would otherwise yield an empty summary — rs
+          // takes the summary from the recorded item (compact.rs:347-350).
+          if (
+            raw["type"] === "response.output_item.done" &&
+            item?.["type"] === "message" &&
+            !sawSummaryDelta
+          ) {
+            summaryText += messageOutputText(item);
+          }
         } else if (raw["type"] === "response.completed") {
           // First terminal event wins: anything after it is transport noise
-          // (same rule as the turn loop's terminal_first_wins).
+          // (same rule as the turn loop). Leaving the loop cancels the body.
           sawCompleted = true;
           break;
         } else if (
           raw["type"] === "response.failed" ||
-          raw["type"] === "response.incomplete"
+          raw["type"] === "response.incomplete" ||
+          raw["type"] === "error"
         ) {
           // Terminal stream event — same classification as the turn loop
-          // (context-window-exceeded → trim; quota/policy failures → terminal;
-          // otherwise retryable). mirrors process_responses_event.
+          // (context-window-exceeded → trim; quota/policy failures and the
+          // output cap → terminal; otherwise retryable). mirrors
+          // process_responses_event.
           throw classifyStreamFailure(raw);
         }
       }

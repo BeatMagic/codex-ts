@@ -126,13 +126,47 @@ describe("classifyStreamFailure", () => {
     ).toBeUndefined();
   });
 
-  it("turns response.incomplete into a retryable stream error carrying the reason", () => {
-    const err = classifyStreamFailure({
-      type: "response.incomplete",
-      response: { incomplete_details: { reason: "max_output_tokens" } },
-    });
-    expect(err.message).toContain("Incomplete response returned, reason: max_output_tokens");
-    expect(isRetryableError(err)).toBe(true);
+  // mirrors #53451 (bc9cad3473): an output-cap incomplete is terminal — the
+  // identical re-send would hit the cap again. (Was retryable before.)
+  it("turns an output-cap response.incomplete into a terminal error carrying the reason", () => {
+    for (const reason of ["max_output_tokens", "max_tokens"]) {
+      const err = classifyStreamFailure({
+        type: "response.incomplete",
+        response: { incomplete_details: { reason } },
+      });
+      expect(err.message).toContain(
+        `Incomplete response returned, reason: ${reason}`,
+      );
+      expect(err.terminal, reason).toBe(true);
+      expect(isRetryableError(err), reason).toBe(false);
+    }
+  });
+
+  // The ace-mv cloud stream guard seals cut streams with these synthetic
+  // reasons and relies on them being retried; content_filter stays retryable
+  // like rs, and an unknown/missing reason stays retryable for compatibility.
+  it("keeps every other response.incomplete retryable", () => {
+    for (const reason of [
+      "clean_eof_no_terminal_event",
+      "upstream_idle_timeout",
+      "upstream_stream_broke",
+      "client_disconnected",
+      "content_filter",
+      "interrupted",
+      "connection closed",
+      "something_new",
+    ]) {
+      const err = classifyStreamFailure({
+        type: "response.incomplete",
+        response: { incomplete_details: { reason } },
+      });
+      expect(err.message).toContain(reason);
+      expect(isRetryableError(err), reason).toBe(true);
+    }
+    // No incomplete_details at all.
+    expect(
+      isRetryableError(classifyStreamFailure({ type: "response.incomplete" })),
+    ).toBe(true);
   });
 });
 

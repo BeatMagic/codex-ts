@@ -150,6 +150,29 @@ const TERMINAL_STREAM_FAILURE_CODES = new Set<string>([
   "slow_down",
 ]);
 
+/**
+ * `response.incomplete` reasons that make the incomplete TERMINAL.
+ * mirrors #53451 (bc9cad3473), where rs maps an incomplete to the
+ * non-retryable ApiError::ResponseIncomplete — narrowed here to the output
+ * cap, the one reason a byte-identical re-send is certain to hit again. It
+ * typically trips while the model writes a huge tool-call argument, before any
+ * text delta, so the turn loop would retry silently and burn up to
+ * (1 + maxRetries)× the output tokens. `max_tokens` covers a proxy that passes
+ * Anthropic's stop_reason through literally.
+ *
+ * Every other reason stays retryable, as before: content_filter (rs keeps it
+ * retryable too), unknown reasons, and above all the synthetic transport
+ * reasons the ace-mv cloud stream guard seals cut streams with
+ * (clean_eof_no_terminal_event, upstream_idle_timeout, upstream_stream_broke,
+ * client_disconnected) — it relies on those being retried, and older proxies
+ * and runtimes stay in the fleet. Upstream's `interrupted` → follow-up
+ * handling is not modelled.
+ */
+const TERMINAL_INCOMPLETE_REASONS = new Set<string>([
+  "max_output_tokens",
+  "max_tokens",
+]);
+
 /** mirrors rate_limit_regex (codex-api/src/sse/responses.rs:656) */
 const RATE_LIMIT_RETRY_AFTER_RE =
   /try again in\s*(\d+(?:\.\d+)?)\s*(ms|s|seconds?)/i;
@@ -179,15 +202,24 @@ export function parseRateLimitRetryAfterMs(
 }
 
 /**
- * Turn a terminal SSE event (`response.failed` / `response.incomplete`) into a
- * ResponsesApiError with the same retry verdict codex-rs would reach.
+ * Turn a terminal SSE event (`response.failed` / `response.incomplete` / a
+ * top-level `error` frame) into a ResponsesApiError with the same retry verdict
+ * codex-rs would reach.
  *
  * mirrors process_responses_event (codex-api/src/sse/responses.rs:387-431):
  *   - `response.failed` inspects `response.error.code` and maps it to a
  *     terminal or retryable CodexErr, honoring a "try again in Xs" delay for
  *     rate limits (everything unrecognised stays Retryable, like rs);
- *   - `response.incomplete` becomes CodexErr::Stream (retryable) carrying the
- *     `incomplete_details.reason`.
+ *   - `response.incomplete` carries the `incomplete_details.reason`; it is
+ *     terminal only for the output cap (see TERMINAL_INCOMPLETE_REASONS),
+ *     otherwise a retryable CodexErr::Stream;
+ *   - an `error` frame is classified like `response.failed` (#56445
+ *     parse_terminal_provider_error reads streamed `error` events). Its
+ *     code/message sit either nested under `error` (rs, Anthropic) or at the
+ *     top level (the OpenAI streaming `error` event); both are read. rs skips
+ *     a frame whose code it does not recognise and reads on, so the stream
+ *     ends without `response.completed` — retryable as well; failing here
+ *     reaches that verdict without waiting for an EOF that may never come.
  * The 503 status is a stand-in for "stream-level failure, no HTTP status" so the
  * retryable ones land in isRetryableStatus's set.
  */
@@ -204,10 +236,18 @@ export function classifyStreamFailure(raw: Record<string, unknown>): ResponsesAp
     return new ResponsesApiError(
       503,
       `Incomplete response returned, reason: ${reason}`,
+      undefined,
+      TERMINAL_INCOMPLETE_REASONS.has(reason),
     );
   }
 
-  const error = response?.["error"] as Record<string, unknown> | undefined;
+  const nested = raw["error"];
+  const error =
+    kind === "error"
+      ? typeof nested === "object" && nested !== null
+        ? (nested as Record<string, unknown>)
+        : raw
+      : (response?.["error"] as Record<string, unknown> | undefined);
   const code = typeof error?.["code"] === "string" ? error["code"] : undefined;
   const message =
     typeof error?.["message"] === "string" ? error["message"] : undefined;

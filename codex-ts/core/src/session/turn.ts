@@ -26,7 +26,11 @@ import type {
   ConversationItem,
   UserContentPart,
 } from "../../../thread-store/src/types.js";
-import { parseSseStream } from "./sse.js";
+import {
+  DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+  messageOutputText,
+  parseSseStream,
+} from "./sse.js";
 import {
   classifyStreamFailure,
   computeRetryDelay,
@@ -116,6 +120,13 @@ export interface TurnConfig {
    * stream/request_max_retries. Defaults to DEFAULT_MAX_RETRIES (5).
    */
   maxRetries?: number | undefined;
+  /**
+   * Longest silence between chunks of a streaming response (sampling and
+   * compaction) before it is abandoned with a retryable "idle timeout waiting
+   * for SSE". mirrors codex-rs stream_idle_timeout_ms. Defaults to
+   * DEFAULT_STREAM_IDLE_TIMEOUT_MS (300_000); zero or negative disables it.
+   */
+  streamIdleTimeoutMs?: number | undefined;
   /**
    * Overrides the inline-compaction summarization prompt. mirrors
    * `config.compact_prompt` (compact.rs:118-123) — omit to use the bundled
@@ -590,8 +601,11 @@ export async function runTurn(
       let emittedOutput = false;
       // Whether THIS attempt's stream has already delivered response.completed.
       // A terminal event is terminal — anything arriving after it is transport
-      // noise, not turn state. See the response.failed arm below.
+      // noise, not turn state. See the end of the stream loop below.
       let sawCompleted = false;
+      // Message items that streamed output_text deltas — their completed
+      // item's text must not be counted again. See output_item.done.
+      const streamedMessageIds = new Set<string>();
       // The compaction generation this request's history was built under.
       // Concurrent turns share the session: if another turn compacted while
       // this request was in flight, its usage measures a history that no
@@ -622,7 +636,10 @@ export async function runTurn(
         }
 
         // ── Parse SSE stream ──────────────────────────────────────────────
-        for await (const raw of parseSseStream(res.body)) {
+        for await (const raw of parseSseStream(res.body, {
+          idleTimeoutMs:
+            config.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+        })) {
           switch (raw["type"]) {
             case "response.output_item.added": {
               const item = raw["item"] as Record<string, unknown> | undefined;
@@ -651,6 +668,7 @@ export async function runTurn(
             case "response.output_text.delta": {
               const delta = String(raw["delta"] ?? "");
               assistantText += delta;
+              streamedMessageIds.add(String(raw["item_id"] ?? currentItemId));
               // Visible output has streamed — past this point a retry would
               // duplicate text, so failures below are no longer retryable.
               emittedOutput = true;
@@ -716,6 +734,30 @@ export async function runTurn(
                   name: String(item["name"]),
                   arguments: String(item["arguments"] ?? "{}"),
                 });
+              } else if (item?.["type"] === "message") {
+                // Some providers/proxies deliver a message's text ONLY in the
+                // completed item, with no output_text.delta — rs keeps it
+                // because it records the completed item itself
+                // (stream_events_utils.rs record_completed_response_item).
+                // Take it only when nothing streamed for this item (by its id,
+                // or deltas that carried no item_id and were credited to the
+                // current item), so streamed text is never counted twice; it
+                // is emitted as one delta so the host renders it.
+                const doneId = String(item["id"] ?? currentItemId);
+                if (
+                  !streamedMessageIds.has(doneId) &&
+                  !streamedMessageIds.has(currentItemId)
+                ) {
+                  const text = messageOutputText(item);
+                  if (text) {
+                    assistantText += text;
+                    emittedOutput = true;
+                    emitEvent({
+                      type: "AgentMessageContentDelta",
+                      event: { turn_id: turnId, item_id: doneId, delta: text },
+                    });
+                  }
+                }
               }
               break;
             }
@@ -825,32 +867,48 @@ export async function runTurn(
               break;
             }
             case "response.failed":
-            case "response.incomplete": {
-              // A failed/incomplete arriving AFTER response.completed must not
-              // un-complete the turn. Observed 2026-08-04 in production: the
-              // upstream delivered the full stream then held the connection
-              // open, and a gateway watchdog sealed the hold with a synthetic
-              // response.incomplete AFTER the completed frame. Throwing here
-              // classified a COMPLETE turn as a retryable 503, so the client
-              // re-sent the byte-identical request in an endless token-burning
-              // loop. First terminal event wins; later ones are transport noise.
-              if (sawCompleted) {
-                break;
-              }
+            case "response.incomplete":
+            case "error": {
               // mirrors codex-api sse/responses.rs process_responses_event's
               // terminal arms (responses.rs:387-431): `response.failed` is
               // classified from `response.error.code` — quota / cyber-policy /
               // invalid-prompt / server-overloaded are TERMINAL (rs maps them to
               // non-retryable CodexErr variants), a rate limit carries its
-              // "try again in Xs" delay, anything unrecognised stays retryable —
-              // and `response.incomplete` becomes a retryable stream error.
+              // "try again in Xs" delay, anything unrecognised stays retryable.
+              // `response.incomplete` is terminal for the output cap, otherwise
+              // retryable; a top-level `error` frame is classified like
+              // `response.failed` (#56445) — it used to be ignored, so an error
+              // followed by EOF ended the turn as a success.
               // context-window-exceeded is detected by the catch below, which
               // also marks the session tokens full.
               throw classifyStreamFailure(raw);
             }
           }
+          // First terminal event wins: stop reading right after
+          // response.completed, which also cancels the body (closes the
+          // connection) — mirrors responses.rs returning once it forwarded
+          // Completed. Reading on until EOF let a held-open connection delay
+          // the turn, and a late frame poison it: 2026-08-04 in production an
+          // upstream held the connection after the full stream, a gateway
+          // watchdog sealed it with a synthetic response.incomplete AFTER the
+          // completed frame, and treating that as terminal re-sent the
+          // byte-identical request in an endless token-burning loop.
+          if (sawCompleted) break;
         }
-        break; // stream consumed successfully → leave the retry loop
+        // A stream that ends without response.completed was cut off: it is a
+        // retryable failure, never a success — persisting it would record
+        // partial text as a complete message, drop a half-streamed call, or end
+        // the turn silently truncated. mirrors turn.rs:2259-2263
+        // CodexErr::Stream. The usual policy then applies: retried only while
+        // no visible output has streamed, otherwise surfaced (nothing from this
+        // attempt is persisted).
+        if (!sawCompleted) {
+          throw new ResponsesApiError(
+            503,
+            "stream closed before response.completed",
+          );
+        }
+        break; // stream completed → leave the retry loop
       } catch (err) {
         // An interrupt is terminal — never retry past a cancellation.
         if (abortSignal?.aborted) throw err;
