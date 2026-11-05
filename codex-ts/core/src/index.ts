@@ -24,10 +24,12 @@ export {
 export { DEFAULT_STREAM_IDLE_TIMEOUT_MS } from "./session/sse.js";
 export {
   ensureCallOutputsPresent,
+  historyForPrompt,
   normalizeHistory,
   removeCorrespondingFor,
   removeOrphanOutputs,
 } from "./normalize.js";
+export { RequestGate } from "./session/request_gate.js";
 export type { CodexThreadConfig } from "./codex_thread.js";
 export { DEFAULT_BASE_INSTRUCTIONS } from "./base_instructions.js";
 export {
@@ -51,4 +53,11 @@ export type {
   ToolRouterContext,
   ToolRouterOptions,
 } from "./tools/router.js";
+export {
+  DEFAULT_TOOL_OUTPUT_MAX_BYTES,
+  truncateFunctionCallOutput,
+  truncateFunctionOutputItems,
+  truncateMiddleChars,
+} from "./tools/output_truncation.js";
+export type { FunctionCallOutputContentItem } from "../../thread-store/src/types.js";
 export { GoalToolExecutor } from "../../ext/goal/src/tool.js";

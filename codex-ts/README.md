@@ -87,6 +87,33 @@ const thread = new CodexThread({
 The same budget covers both the initial request and a stream that drops before
 any output; `Retry-After` overrides the computed backoff for that attempt.
 
+## Custom tools
+
+Host tools are passed as `customTools` (`CustomTool`: `name`, `spec()`,
+`execute(args, ctx)`). `execute` returns the call's output — a string, or an
+array of `input_text` / `input_image` items (`FunctionCallOutputContentItem`,
+mirrors codex-rs `FunctionCallOutputBody::ContentItems`) to hand the model an
+image.
+
+- **Interrupts.** `ctx.signal` aborts when the turn is interrupted. The turn
+  does not wait for the tool: it records `aborted by user after Xs` for the
+  running call (and a not-executed output for calls of the round that never
+  started), persists them, and ends with `TurnAborted` at once; a result the
+  tool returns later is discarded. A turn parked in `request_user_input` is
+  interrupted the same way. `Interrupt` reaches every in-flight turn of the
+  thread.
+- **Errors.** A tool that throws does not end the turn: the error message
+  becomes the call's output and the model carries on (codex-rs
+  `failure_response`).
+- **Output truncation (opt-in).** `maxOutputBytes` middle-truncates a tool's
+  output to that many UTF-8 bytes of text (images are kept) before it enters
+  the model's history, with a `…N chars truncated…` marker — the codex-rs
+  algorithm. `DEFAULT_TOOL_OUTPUT_MAX_BYTES` (12 000) is codex-rs's budget.
+  Leave it unset for outputs the model must read whole.
+
+A thread sends at most one model request at a time (sampling or compaction);
+turns that overlap queue their requests, never their tools.
+
 ## Persistence and resume
 
 With a `threadStore` or `ioBackend`, a thread's rollout is persisted as one
@@ -114,6 +141,10 @@ an oversized request.
 `LiveThread.loadConversationHistory()` still returns the **raw** transcript —
 every item ever appended — for chat UIs; use `LiveThread.loadResumeState()`
 for the model-visible context.
+
+Tool outputs are persisted whole; a tool's `maxOutputBytes` applies only to the
+model's copy, so a resumed thread re-applies it to the items it replays (not to
+a checkpoint's replacement history, which is already the model's copy).
 
 Logs written before checkpoints existed (no `Compacted` line) resume as a full
 replay, as before. Older readers skip the new line kinds and keep their full

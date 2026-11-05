@@ -99,7 +99,7 @@ export function estimateItemTokenCount(item: ConversationItem): number {
       bytes += utf8ByteLength(item.name) + jsonStringBytes(item.arguments);
       break;
     case "function_call_output":
-      // Typed string, but hosts store content-part arrays here (view_image).
+      // A string or a content-item array (view_image): images at a fixed cost.
       bytes += contentBytes(item.output as unknown);
       break;
   }
@@ -189,8 +189,9 @@ export class SessionTokenState {
    * The last HISTORY item `total` accounts for, by object identity — the
    * covered-item boundary of #58404 (rs last_server_reported_usage_item_count,
    * history.rs:536-543). An object reference rather than an index, so it
-   * survives in-place rewrites (normalizeHistory inserting placeholders) and
-   * concurrent appends. `null`: no history item is covered — everything counts,
+   * survives concurrent appends (and the request's pairing placeholders, which
+   * live only in its normalized copy, are never a boundary). `null`: no
+   * history item is covered — everything counts,
    * like rs's boundary 0 on a fresh history. `undefined`: the total was
    * recorded without a boundary (a caller that predates it) — see
    * getTotalTokenUsage for the fallback.

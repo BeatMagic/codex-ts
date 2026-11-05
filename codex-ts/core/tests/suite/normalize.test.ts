@@ -7,17 +7,24 @@
  * plus the end-to-end regression for the production incident: a resumed
  * thread whose persisted history ends with an unpaired function_call must
  * sample with a repaired input (Anthropic otherwise 400s: "tool_use ids were
- * found without tool_result blocks immediately after").
+ * found without tool_result blocks immediately after"). The repair is applied
+ * to each request's COPY only (clone_history().for_prompt()): the live history
+ * never carries a synthetic output.
  */
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
   ensureCallOutputsPresent,
+  historyForPrompt,
   normalizeHistory,
   removeCorrespondingFor,
   removeOrphanOutputs,
 } from "../../src/normalize.js";
 import { CodexThread } from "../../src/codex_thread.js";
+import { runInlineAutoCompactTask } from "../../src/compact.js";
+import { runTurn } from "../../src/session/turn.js";
+import { ToolRouter } from "../../src/tools/router.js";
+import { GoalToolExecutor } from "../../../ext/goal/src/tool.js";
 import { InMemoryIoBackend } from "../../../thread-store/src/io_backend.js";
 import { LocalThreadStore } from "../../../thread-store/src/local_thread_store.js";
 import type { ConversationItem } from "../../../thread-store/src/types.js";
@@ -106,6 +113,90 @@ describe("normalizeHistory", () => {
       { type: "function_call_output", call_id: "c1", output: "aborted" },
       user("mid"),
     ]);
+  });
+});
+
+describe("historyForPrompt", () => {
+  it("returns a normalized copy and leaves the live array untouched", () => {
+    const live = [user("hi"), call("c1"), output("ghost")];
+    const before = [...live];
+    expect(historyForPrompt(live)).toEqual([
+      user("hi"),
+      call("c1"),
+      { type: "function_call_output", call_id: "c1", output: "aborted" },
+    ]);
+    expect(live).toEqual(before);
+  });
+});
+
+// ─── Integration: placeholders never reach the live history ───────────────────
+// The cache/duplicate-output hazard (codex-ts audit B §3.2): a request sent
+// while a call is still running used to splice "aborted" into the LIVE array;
+// the real output then landed at the tail and every later request carried two
+// outputs for one call.
+
+const reply = () =>
+  makeSseResponse(sseFlat([evResponseCreated("r"), evAssistantMessage("ok"), evCompleted("r")]));
+
+function outputsOf(items: ConversationItem[], callId: string): ConversationItem[] {
+  return items.filter(
+    (item) => item.type === "function_call_output" && item.call_id === callId,
+  );
+}
+
+describe("the live history never carries a synthetic output", () => {
+  it("after a request with an unpaired call, a late real output is the only one sent", async () => {
+    const history: ConversationItem[] = [user("do work"), call("c1")];
+    const bodies: { input: ConversationItem[] }[] = [];
+    const fetch = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)) as { input: ConversationItem[] });
+      return reply();
+    });
+    const turn = (text: string) =>
+      runTurn(
+        `turn-${bodies.length}`,
+        [{ type: "text", text }],
+        history,
+        { apiKey: "k", baseUrl: "http://x", model: "m", fetch },
+        new ToolRouter(new GoalToolExecutor("live")),
+        new Map(),
+        () => undefined,
+      );
+
+    // An overlapping request while c1's tool is still running…
+    await turn("meanwhile");
+    expect(outputsOf(bodies[0]!.input, "c1")).toEqual([
+      { type: "function_call_output", call_id: "c1", output: "aborted" },
+    ]);
+    // …must not plant the placeholder in the live history.
+    expect(outputsOf(history, "c1")).toEqual([]);
+
+    // The real output lands late, at the tail.
+    history.push(output("c1"));
+    await turn("next");
+    expect(outputsOf(bodies[1]!.input, "c1")).toEqual([output("c1")]);
+  });
+
+  it("a compaction keeps a call still waiting for its output unpaired, and drops orphans", async () => {
+    const history: ConversationItem[] = [user("a"), call("old")];
+    const fetch = vi.fn(async () => {
+      // While the summarizer runs: the summarized call's output arrives (an
+      // orphan once "old" is summarized away), and another turn starts a call
+      // whose tool is still running.
+      history.push(output("old"), call("running"));
+      return makeSseResponse(
+        sseFlat([evResponseCreated("s"), evAssistantMessage("SUM"), evCompleted("s")]),
+      );
+    });
+    await runInlineAutoCompactTask(history, {
+      apiKey: "k",
+      baseUrl: "http://x",
+      model: "m",
+      fetch,
+    });
+    expect(outputsOf(history, "old")).toEqual([]);
+    expect(history).toContainEqual(call("running"));
+    expect(outputsOf(history, "running")).toEqual([]);
   });
 });
 

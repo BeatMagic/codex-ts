@@ -8,6 +8,7 @@
 import type { EventMsg } from "../../../protocol/src/protocol.js";
 import type { RequestUserInputResponse } from "../../../protocol/src/request_user_input.js";
 import type { ToolSpec } from "../../../tools/src/tool_spec.js";
+import type { FunctionCallOutputContentItem } from "../../../thread-store/src/types.js";
 import { GoalToolExecutor } from "../../../ext/goal/src/tool.js";
 import {
   CREATE_GOAL_TOOL_NAME,
@@ -38,6 +39,9 @@ export interface ToolRouterContext {
   pendingInputs: PendingInputs;
   /** Emit an event immediately — used for events that must fire before suspension */
   emitEvent: (msg: EventMsg) => void;
+  /** The turn's abort signal, handed to every tool (CustomToolContext.signal)
+   *  and to a parked request_user_input. Omitted → a signal that never aborts. */
+  signal?: AbortSignal | undefined;
 }
 
 // =============================================================================
@@ -50,12 +54,21 @@ export interface ToolRouterContext {
 
 /**
  * Context handed to a CustomTool's execute(). Carries the identifiers a host
- * needs to correlate the call (callId / turnId) and an emitEvent escape hatch.
+ * needs to correlate the call (callId / turnId), an emitEvent escape hatch and
+ * the turn's abort signal.
  */
 export interface CustomToolContext {
   callId: string;
   turnId: string;
   emitEvent: (msg: EventMsg) => void;
+  /**
+   * Aborts when the turn is interrupted. mirrors the cancellation token rs
+   * hands dynamic tools (handlers/dynamic.rs, #51556). The turn does not wait
+   * for the tool: on interrupt it records "aborted by user after Xs" for the
+   * call and ends at once, discarding whatever the tool returns later — so a
+   * tool should stop its own work (abort its fetches, stop polling) here.
+   */
+  signal: AbortSignal;
 }
 
 /**
@@ -63,15 +76,33 @@ export interface CustomToolContext {
  *
  * TypeScript equivalent of implementing `ToolExecutor<ToolInvocation>` in
  * codex-rs: the host provides the spec (advertised to the model) and an async
- * execute() whose returned string becomes the function_call_output sent back.
+ * execute() whose result becomes the function_call_output sent back.
  */
 export interface CustomTool {
   /** Tool name as advertised to and called by the model */
   name: string;
   /** ToolSpec included in Responses API requests */
   spec(): ToolSpec;
-  /** Run the call; the returned string is fed back to the model as output */
-  execute(args: unknown, ctx: CustomToolContext): Promise<string>;
+  /**
+   * Run the call; the result is fed back to the model as the output — a
+   * string, or content items (e.g. `[input_image, input_text]` to show the
+   * model an image; mirrors FunctionCallOutputBody::ContentItems). A throw is
+   * reported to the model as the call's output; the turn carries on.
+   */
+  execute(
+    args: unknown,
+    ctx: CustomToolContext,
+  ): Promise<string | FunctionCallOutputContentItem[]>;
+  /**
+   * Opt this tool's outputs into middle truncation: at most this many UTF-8
+   * bytes of text enter the model-visible history (images are kept), with a
+   * "…N chars truncated…" marker in the middle. The full output is still
+   * persisted, so a transcript replays it whole; a resumed thread truncates
+   * it again. DEFAULT_TOOL_OUTPUT_MAX_BYTES is codex-rs's budget. Absent →
+   * the output is recorded verbatim. Leave it unset for outputs the model must
+   * read whole (documents, JSON it parses, ids it copies).
+   */
+  maxOutputBytes?: number | undefined;
 }
 
 const GOAL_TOOL_NAMES: ReadonlySet<string> = new Set([
@@ -107,6 +138,23 @@ export class ToolRouter {
     this.enableGoalTools = options.enableGoalTools ?? true;
   }
 
+  /**
+   * The output byte budget of `toolName`, when it is a custom tool that opted
+   * in (CustomTool.maxOutputBytes); built-ins are never truncated, including
+   * one that shadows a custom tool of the same name (see dispatch).
+   */
+  maxOutputBytesFor(toolName: string): number | undefined {
+    const builtin =
+      toolName === REQUEST_USER_INPUT_TOOL_NAME ||
+      toolName === UPDATE_PLAN_TOOL_NAME ||
+      (this.enableGoalTools && GOAL_TOOL_NAMES.has(toolName));
+    if (builtin) return undefined;
+    const maxBytes = this.customTools.get(toolName)?.maxOutputBytes;
+    return typeof maxBytes === "number" && Number.isFinite(maxBytes) && maxBytes >= 0
+      ? Math.floor(maxBytes)
+      : undefined;
+  }
+
   /** All tool specs to include in Responses API requests */
   toolSpecs(): ToolSpec[] {
     return [
@@ -129,7 +177,7 @@ export class ToolRouter {
     callId: string,
     rawArgs: unknown,
     ctx: ToolRouterContext,
-  ): Promise<string> {
+  ): Promise<string | FunctionCallOutputContentItem[]> {
     const args = (typeof rawArgs === "object" && rawArgs !== null
       ? rawArgs
       : {}) as Record<string, unknown>;
@@ -186,7 +234,11 @@ export class ToolRouter {
           },
         });
         const response = await handleRequestUserInput(
-          { turnId: ctx.turnId, pendingInputs: ctx.pendingInputs },
+          {
+            turnId: ctx.turnId,
+            pendingInputs: ctx.pendingInputs,
+            signal: ctx.signal,
+          },
           normalized.questions,
         );
         return formatRequestUserInputOutput(response);
@@ -212,6 +264,7 @@ export class ToolRouter {
             callId,
             turnId: ctx.turnId,
             emitEvent: ctx.emitEvent,
+            signal: ctx.signal ?? new AbortController().signal,
           });
         }
         // A bare `{error: "Unknown tool: <name>"}` returns the one fact the

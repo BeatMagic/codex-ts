@@ -24,7 +24,12 @@ import {
   ResponsesApiError,
   sleep,
 } from "./session/retry.js";
-import { normalizeHistory, removeCorrespondingFor } from "./normalize.js";
+import {
+  normalizeHistory,
+  removeCorrespondingFor,
+  removeOrphanOutputs,
+} from "./normalize.js";
+import { acquireRequestGate } from "./session/request_gate.js";
 import {
   approxTokenCount,
   estimateItemsTokenCount,
@@ -240,11 +245,11 @@ export async function runInlineAutoCompactTask(
   const summarizerInput: ConversationItem[] = [...history];
   normalizeHistory(summarizerInput);
   // The items this summary will describe, by identity. Concurrent turns share
-  // `history` and keep appending while the summarizer runs (or rewrite it in
-  // place: normalizeHistory inserts placeholders) — whatever is not in this
-  // set at apply time is NEWER than the summary and is kept after it, instead
-  // of being silently dropped. mirrors the rs prefix install that appends the
-  // live suffix (session/mod.rs replace_compacted_history) and #59404.
+  // `history` and keep appending while the summarizer runs — whatever is not
+  // in this set at apply time is NEWER than the summary and is kept after
+  // it, instead of being silently dropped. mirrors the rs prefix install
+  // that appends the live suffix (session/mod.rs replace_compacted_history)
+  // and #59404.
   const summarized = new Set<ConversationItem>(history);
   const abortSignal = config.abortSignal;
   const throwIfAborted = (): void => {
@@ -296,6 +301,11 @@ export async function runInlineAutoCompactTask(
         };
     if (config.instructions) body["instructions"] = config.instructions;
 
+    // Same per-thread request gate as a sampling request (request_gate.ts).
+    const releaseRequest = await acquireRequestGate(
+      config.requestGate,
+      abortSignal,
+    );
     try {
       const res = await (config.fetch ?? fetch)(`${config.baseUrl}/responses`, {
         method: "POST",
@@ -447,6 +457,8 @@ export async function runInlineAutoCompactTask(
         continue;
       }
       throw err;
+    } finally {
+      releaseRequest();
     }
   }
 
@@ -475,14 +487,17 @@ export async function runInlineAutoCompactTask(
   );
 
   // Build replacement history and mutate in place: summary first, then the
-  // newer items (mirrors compact_pending_input::insert_summary). Pairing is
-  // re-established for the newer part: an output whose call was summarized
-  // away would otherwise be an orphan the next request trips over.
+  // newer items (mirrors compact_pending_input::insert_summary). An output
+  // whose call was summarized away is dropped: it would be an orphan. Only
+  // that half of normalization: this array BECOMES the live history, and a
+  // newer call still waiting for its output (a concurrent turn's tool) must
+  // not get a synthetic "aborted" here — placeholders live only in request
+  // copies (historyForPrompt), or the real output lands as a second one.
   const newHistory = [
     ...buildCompactedHistory(userMessages, fullSummary),
     ...newer,
   ];
-  normalizeHistory(newHistory);
+  removeOrphanOutputs(newHistory);
   history.length = 0;
   for (const item of newHistory) history.push(item);
   config.onHistoryReplaced?.(history, fullSummary);

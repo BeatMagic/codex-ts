@@ -1,6 +1,7 @@
 export type {
   CompactedItem,
   ConversationItem,
+  FunctionCallOutputContentItem,
   RolloutItem,
   CreateThreadParams,
   AppendThreadItemsParams,

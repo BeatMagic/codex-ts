@@ -24,8 +24,12 @@ import type { PendingInputs } from "../tools/handlers/request_user_input.js";
 import type { LiveThread } from "../../../thread-store/src/live_thread.js";
 import type {
   ConversationItem,
+  FunctionCallOutputContentItem,
   UserContentPart,
 } from "../../../thread-store/src/types.js";
+import { applyOutputPolicy } from "../tools/output_truncation.js";
+import { acquireRequestGate } from "./request_gate.js";
+import type { RequestGate } from "./request_gate.js";
 import {
   DEFAULT_STREAM_IDLE_TIMEOUT_MS,
   messageOutputText,
@@ -42,7 +46,7 @@ import {
   sleep,
 } from "./retry.js";
 import { runInlineAutoCompactTask } from "../compact.js";
-import { normalizeHistory } from "../normalize.js";
+import { historyForPrompt } from "../normalize.js";
 import { AutoCompactWindow } from "../state/auto_compact_window.js";
 import {
   recomputeTokenUsage,
@@ -112,6 +116,13 @@ export interface TurnConfig {
    * Omit → a fresh per-turn state (one-shot/tests).
    */
   tokenState?: SessionTokenState | undefined;
+  /**
+   * Thread-scoped request gate: at most one model request (sampling or
+   * summarizer) in flight per thread, held only for the fetch + stream, never
+   * across tools. The thread owns ONE instance, threaded through every runTurn
+   * like compactWindow. Omit → ungated (one-shot/tests). See request_gate.ts.
+   */
+  requestGate?: RequestGate | undefined;
   /**
    * Max retries for transient Responses request/stream failures — network
    * errors, 5xx / 408 / 409 / 429, or a stream dropped before any visible
@@ -352,6 +363,80 @@ async function runCompactAndRecompute(
   }
 }
 
+// ─── Interrupted tool calls ──────────────────────────────────────────────────
+
+/**
+ * The output of a call that was never started because the turn was
+ * interrupted first. rs has no sequential equivalent (it starts every call as
+ * soon as it streams in), so this says what happened: nothing ran.
+ */
+const NOT_EXECUTED_OUTPUT =
+  "aborted by user before this call started; it was not executed";
+
+/** mirrors ToolCallRuntime::abort_message (tools/parallel.rs) for a
+ *  non-shell tool: "aborted by user after {secs:.1}s", at least 0.1s. */
+function abortedByUserOutput(startedAtMs: number): string {
+  const secs = Math.max((Date.now() - startedAtMs) / 1000, 0.1);
+  return `aborted by user after ${secs.toFixed(1)}s`;
+}
+
+/**
+ * Settle with the dispatch's result, or reject with an AbortError the moment
+ * the turn is interrupted — whichever comes first. mirrors the tokio::select!
+ * between the dispatch task and cancellation_token.cancelled() in
+ * parallel.rs. A tool that already finished wins (rs: is_finished()); one
+ * that keeps running is abandoned and its late result ignored.
+ */
+function untilAborted<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  if (!signal) return promise;
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void =>
+      reject(new DOMException("Turn interrupted", "AbortError"));
+    // Subscribed before the abort check, so the abandoned promise's eventual
+    // rejection is always handled (never an unhandled rejection).
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (err: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err);
+      },
+    );
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * Record the outputs of an interrupted round's calls. Persistence is queued,
+ * not awaited: TurnAborted must not wait on a host write, and the ordered
+ * queue still lands these lines before anything a later turn appends.
+ */
+function recordInterruptedCalls(
+  history: HistoryItem[],
+  liveThread: LiveThread | undefined,
+  outputs: { call_id: string; output: string }[],
+): void {
+  if (outputs.length === 0) return;
+  const items = outputs.map(
+    ({ call_id, output }): HistoryItem => ({
+      type: "function_call_output",
+      call_id,
+      output,
+    }),
+  );
+  history.push(...items);
+  void liveThread?.appendConversationItems(items);
+}
+
 // ─── runTurn ─────────────────────────────────────────────────────────────────
 
 export interface TurnResult {
@@ -536,7 +621,9 @@ export async function runTurn(
     // normalize_history): synthesize "aborted" outputs for calls that never
     // got one (interrupted turn, resumed corrupted thread) and drop orphaned
     // outputs. Anthropic 400s on unpaired tool_use/tool_result otherwise.
-    normalizeHistory(history);
+    // Applied to this request's COPY only: the live history never carries a
+    // placeholder (see historyForPrompt).
+    const promptHistory = historyForPrompt(history);
 
     // ── Replay hygiene ──────────────────────────────────────────────────────
     // Execution repairs malformed tool arguments before dispatch, but history
@@ -569,7 +656,7 @@ export async function runTurn(
       input: [
         ...(config.contextItems ?? []),
         ...skillInjectionItems,
-        ...history,
+        ...promptHistory,
       ],
       tools,
       stream: true,
@@ -611,6 +698,14 @@ export async function runTurn(
       // this request was in flight, its usage measures a history that no
       // longer exists. See the usage guard in the response.completed arm.
       const epochAtBuild = compactWindow.currentCompactionEpoch();
+      // One request in flight per thread (session/request_gate.ts). Held for
+      // this attempt's fetch + stream (and its retry backoff) and released in
+      // `finally` — before any tool runs, so a turn parked in a tool never
+      // blocks another turn's request.
+      const releaseRequest = await acquireRequestGate(
+        config.requestGate,
+        abortSignal,
+      );
 
       try {
         const res = await (config.fetch ?? fetch)(
@@ -935,6 +1030,8 @@ export async function runTurn(
           event: { message: `Reconnecting... ${retryAttempt}/${maxRetries}` },
         });
         await sleep(computeRetryDelay(err, retryAttempt), abortSignal);
+      } finally {
+        releaseRequest();
       }
     }
 
@@ -967,17 +1064,29 @@ export async function runTurn(
     if (functionCalls.length === 0) break;
 
     // ── Dispatch tool calls ─────────────────────────────────────────────────
-    // Abort semantics (mirrors codex-rs, where the turn task is killed
-    // outright): once interrupted, never start another tool and DISCARD the
-    // result of the one that was mid-flight — do NOT record it. The next
-    // turn's normalizeHistory synthesizes an "aborted" output for the calls
-    // left unpaired. Recording here instead would race that synthesis: the
-    // new turn inserts "aborted", then this zombie loop lands the real output
-    // too → duplicate outputs for one call_id → Anthropic 400 ("each tool_use
-    // must have a single result") persisted into the thread
+    // Abort semantics (mirrors tools/parallel.rs handle_tool_call_with_source,
+    // which select!s every dispatch against the turn's cancellation token, and
+    // #51556 for host-provided tools): an interrupt ends the turn AT ONCE, even
+    // while a tool is still running. The running call gets rs's "aborted by
+    // user after Xs" output, every call of this round that never started gets
+    // a not-executed one, and all of them are recorded and persisted before
+    // the AbortError — so the thread, live or resumed, has every call paired.
+    // The tool sees the interrupt through ctx.signal; if it keeps running
+    // anyway, its late result is DISCARDED: recording it would give the call a
+    // second output → Anthropic 400 ("each tool_use must have a single
+    // result") persisted into the thread
     // (openrouter-responses-errors/2026-07-18/a1cf9c62).
-    for (const call of functionCalls) {
+    const toolSignal = abortSignal ?? new AbortController().signal;
+    for (const [index, call] of functionCalls.entries()) {
       if (abortSignal?.aborted) {
+        recordInterruptedCalls(
+          history,
+          liveThread,
+          functionCalls.slice(index).map((pending) => ({
+            call_id: pending.call_id,
+            output: NOT_EXECUTED_OUTPUT,
+          })),
+        );
         throw new DOMException("Turn interrupted", "AbortError");
       }
       let args: unknown;
@@ -1007,23 +1116,54 @@ export async function runTurn(
         continue;
       }
 
-      const output = await router.dispatch(call.name, call.call_id, args, {
-        turnId,
-        pendingInputs,
-        emitEvent,
-      });
-
-      // Interrupted while this tool ran → drop its output (see block comment).
-      if (abortSignal?.aborted) {
-        throw new DOMException("Turn interrupted", "AbortError");
+      const startedAtMs = Date.now();
+      let output: string | FunctionCallOutputContentItem[];
+      try {
+        output = await untilAborted(
+          router.dispatch(call.name, call.call_id, args, {
+            turnId,
+            pendingInputs,
+            emitEvent,
+            signal: toolSignal,
+          }),
+          abortSignal,
+        );
+      } catch (err) {
+        if (abortSignal?.aborted) {
+          // Interrupted while this tool ran (see block comment).
+          recordInterruptedCalls(history, liveThread, [
+            { call_id: call.call_id, output: abortedByUserOutput(startedAtMs) },
+            ...functionCalls.slice(index + 1).map((pending) => ({
+              call_id: pending.call_id,
+              output: NOT_EXECUTED_OUTPUT,
+            })),
+          ]);
+          throw new DOMException("Turn interrupted", "AbortError");
+        }
+        // A throwing tool is the model's to handle, not the turn's: the error
+        // goes back as the call's output and the turn carries on (mirrors
+        // parallel.rs failure_response — only a Fatal error ends the turn).
+        // Ending the turn here used to leave the call unpaired, so the model
+        // never learned what failed. An AbortError from the tool's OWN fetch
+        // (turn not interrupted) is just another failure.
+        console.warn(
+          `[codex] tool ${call.name} (${call.call_id}) threw; ` +
+            `returning the error to the model:`,
+          err,
+        );
+        output = err instanceof Error && err.message ? err.message : String(err);
       }
 
+      // The model sees the output under its tool's policy; the rollout keeps
+      // the original (see tools/output_truncation.ts).
       const outputItem: HistoryItem = {
         type: "function_call_output",
         call_id: call.call_id,
         output,
       };
-      history.push(outputItem);
+      history.push(
+        applyOutputPolicy(outputItem, router.maxOutputBytesFor(call.name)),
+      );
       await liveThread?.appendConversationItems([outputItem]);
     }
 

@@ -1,8 +1,8 @@
 /**
  * mirrors codex-rs/core/src/context_manager/normalize.rs
  *
- * History pairing invariants, enforced right before every model request
- * (mirrors history.for_prompt → normalize_history):
+ * History pairing invariants, enforced on a COPY of the history right before
+ * every model request (mirrors clone_history().for_prompt() → normalize_history):
  *   1. every function_call has a corresponding function_call_output
  *      (a missing one gets a synthetic "aborted" output — e.g. the turn was
  *      interrupted, or compaction rewrote history between call and dispatch);
@@ -64,12 +64,32 @@ export function removeOrphanOutputs(items: ConversationItem[]): void {
 }
 
 /**
- * Enforce both pairing invariants in place. Run this on the history right
- * before building a model request. mirrors normalize_history (history.rs:356).
+ * Enforce both pairing invariants in place, on a request's COPY of the history
+ * (see historyForPrompt) — never on the live array. mirrors normalize_history
+ * (history.rs:356).
  */
 export function normalizeHistory(items: ConversationItem[]): void {
   ensureCallOutputsPresent(items);
   removeOrphanOutputs(items);
+}
+
+/**
+ * The history to send in ONE request: a normalized shallow copy. The live
+ * array is never touched — mirrors clone_history().for_prompt() (history.rs);
+ * normalize.rs: "Prompt normalization can run repeatedly without persisting
+ * its synthetic outputs". Splicing the placeholders into the live array, as
+ * this port used to, broke the prompt cache and risked a call with two
+ * outputs: a request sent while a call is still running (an overlapping turn)
+ * planted "aborted" right after the call, the real output then landed at the
+ * tail, every later request carried both, and the proxy's dedupe moved the
+ * real one into the placeholder's slot — a byte change mid-prefix.
+ */
+export function historyForPrompt(
+  history: ConversationItem[],
+): ConversationItem[] {
+  const items = [...history];
+  normalizeHistory(items);
+  return items;
 }
 
 /**

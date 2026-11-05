@@ -30,6 +30,8 @@ import type { ConversationItem } from "../../thread-store/src/types.js";
 import { ToolRouter } from "./tools/router.js";
 import type { CustomTool } from "./tools/router.js";
 import { runTurn } from "./session/turn.js";
+import { RequestGate } from "./session/request_gate.js";
+import { truncateReplayedToolOutputs } from "./tools/output_truncation.js";
 import { AutoCompactWindow } from "./state/auto_compact_window.js";
 import { SessionTokenState } from "./state/token_state.js";
 import { DEFAULT_BASE_INSTRUCTIONS } from "./base_instructions.js";
@@ -250,11 +252,6 @@ export class CodexThread {
   private readonly router: ToolRouter;
   private readonly liveThread: LiveThread;
 
-  /**
-   * AbortController for the in-flight turn, if any.
-   * mirrors: codex-rs uses a tokio CancellationToken propagated from
-   * Op::Interrupt; AbortController is the browser-native equivalent.
-   */
   // Session-scoped compaction window — ONE per thread, threaded into every
   // runTurn so auto-compaction measures context growth across turns, not just
   // within a turn (mirrors codex-rs session state). See TurnConfig.compactWindow.
@@ -263,7 +260,15 @@ export class CodexThread {
   // usage recorded in one turn drives the NEXT turn's pre-sampling compaction
   // check, including the context-window-exceeded self-heal. See TurnConfig.
   private readonly tokenState = new SessionTokenState();
-  private currentTurnAbort: AbortController | null = null;
+  // One model request in flight per thread — same thread-owned pattern. See
+  // TurnConfig.requestGate.
+  private readonly requestGate = new RequestGate();
+  /**
+   * AbortControllers of the in-flight turns.
+   * mirrors: codex-rs uses a tokio CancellationToken propagated from
+   * Op::Interrupt; AbortController is the browser-native equivalent.
+   */
+  private readonly inFlightTurns = new Set<AbortController>();
 
   constructor(config: CodexThreadConfig) {
     this.config = {
@@ -344,6 +349,16 @@ export class CodexThread {
       // than the context window.
       const state = await thread.liveThread.loadResumeState();
       thread.history.push(...state.history);
+      // Outputs are persisted whole and truncated only on their way into the
+      // model's history (tools/output_truncation.ts), so a resume re-applies
+      // each tool's policy to the raw items it replayed — not to the
+      // checkpoint's replacement_history, already the model-visible form
+      // (mirrors rollout_reconstruction.rs: replace(base) + record_items).
+      truncateReplayedToolOutputs(
+        thread.history,
+        state.checkpoint?.replacement_history.length ?? 0,
+        (toolName) => thread.router.maxOutputBytesFor(toolName),
+      );
       const checkpoint = state.checkpoint;
       if (
         checkpoint &&
@@ -429,6 +444,7 @@ export class CodexThread {
           model: op.model ?? this.config.model,
           compactWindow: this.compactWindow,
           tokenState: this.tokenState,
+          requestGate: this.requestGate,
           ...(instructions ? { instructions } : {}),
           ...(contextItems.length > 0 ? { contextItems } : {}),
           ...(this.config.skills.length > 0
@@ -461,7 +477,7 @@ export class CodexThread {
         };
 
         const abortController = new AbortController();
-        this.currentTurnAbort = abortController;
+        this.inFlightTurns.add(abortController);
 
         // Unix seconds, mirroring TurnStartedEvent.started_at /
         // TurnCompleteEvent.started_at (protocol.rs:2019).
@@ -539,9 +555,7 @@ export class CodexThread {
             });
           })
           .finally(() => {
-            if (this.currentTurnAbort === abortController) {
-              this.currentTurnAbort = null;
-            }
+            this.inFlightTurns.delete(abortController);
           });
         break;
       }
@@ -556,7 +570,11 @@ export class CodexThread {
       }
 
       case "Interrupt":
-        this.currentTurnAbort?.abort();
+        // Every in-flight turn, not just the newest (mirrors abort_all_tasks,
+        // tasks/mod.rs). Turns run unawaited, so an older one — e.g. parked in
+        // request_user_input when another started — would otherwise stay
+        // uninterruptible for good.
+        for (const controller of this.inFlightTurns) controller.abort();
         break;
     }
 
