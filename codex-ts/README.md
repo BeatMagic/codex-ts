@@ -118,3 +118,29 @@ for the model-visible context.
 Logs written before checkpoints existed (no `Compacted` line) resume as a full
 replay, as before. Older readers skip the new line kinds and keep their full
 replay, so mixed runtimes are safe.
+
+## Inline compaction
+
+When the context reaches `autoCompactTokenLimit` (growth since the last
+compaction) or `contextWindow` (total), the thread summarizes its history with
+one extra Responses request and replaces the history with the summary plus the
+most recent user messages.
+
+- **The request extends the sampling request.** It carries the same `tools`,
+  `reasoning` and `instructions`, and its `input` is what the last sampling
+  request sent plus what was recorded since, so a prefix-caching provider reads
+  the cache instead of writing the whole history again. The summarization
+  prompt is always the **last** input item, as
+  `{ type: "message", role: "user", content: <prompt> }`. If the model calls a
+  tool or returns no text, that compaction retries once without tools.
+- **Before a turn, compaction runs before the new input is recorded.** The
+  summary covers the history up to the new message, which follows it. If the
+  compaction fails, the input is still recorded.
+- Context tokens are counted as the last measured or estimated total plus an
+  estimate of every item that total does not cover yet.
+
+| Option                    | Default | Meaning |
+| ------------------------- | ------- | ------- |
+| `compactionRequestParity` | `true`  | `false` sends the older summarizer body: history plus prompt, no tools or reasoning. |
+| `isContextualUserMessage` | none    | `(text) => boolean`. User messages it returns `true` for (host-injected context, given their joined `input_text`) are not kept verbatim through a compaction. |
+| `enableGoalTools`         | `true`  | `false` stops advertising `get_goal`, `create_goal` and `update_goal`; a call to one gets the unknown-tool reply. |

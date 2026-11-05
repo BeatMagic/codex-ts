@@ -21,6 +21,7 @@ import { CodexThread } from "../../src/codex_thread.js";
 import { SessionTokenState } from "../../src/state/token_state.js";
 import { isContextWindowExceededText } from "../../src/session/retry.js";
 import type { TurnConfig } from "../../src/session/turn.js";
+import type { EventMsg } from "../../../protocol/src/protocol.js";
 import type { ConversationItem } from "../../../thread-store/src/types.js";
 import {
   evAssistantMessage,
@@ -157,6 +158,43 @@ describe("collectUserMessages", () => {
     expect(isSummaryMessage(previousSummary)).toBe(true);
     expect(isSummaryMessage("first ask")).toBe(false);
   });
+
+  // mirrors parse_user_message → None for contextual content
+  // (event_mapping.rs:114-117): host-injected context is not a user message.
+  it("skips messages the contextual predicate claims, given their flattened text", () => {
+    const seen: string[] = [];
+    const isContextual = (text: string): boolean => {
+      seen.push(text);
+      return text.startsWith("[SYSTEM]");
+    };
+    const history: ConversationItem[] = [
+      { type: "message", role: "user", content: "real ask" },
+      {
+        type: "message",
+        role: "user",
+        content: [
+          { type: "input_text", text: "[SYSTEM] workspace changed" },
+          { type: "input_text", text: "details" },
+        ],
+      },
+      { type: "message", role: "user", content: "[SYSTEM] cue" },
+      { type: "message", role: "user", content: "second ask" },
+    ];
+    expect(collectUserMessages(history, isContextual)).toEqual([
+      "real ask",
+      "second ask",
+    ]);
+    // input_text parts joined with "\n" — the same text that would be retained.
+    expect(seen).toContain("[SYSTEM] workspace changed\ndetails");
+  });
+
+  it("keeps every user message without a predicate (unchanged default)", () => {
+    const history: ConversationItem[] = [
+      { type: "message", role: "user", content: "[SYSTEM] cue" },
+      { type: "message", role: "user", content: "ask" },
+    ];
+    expect(collectUserMessages(history)).toEqual(["[SYSTEM] cue", "ask"]);
+  });
 });
 
 describe("buildCompactedHistory", () => {
@@ -253,10 +291,14 @@ describe("mid-turn auto-compaction", () => {
     const compacted = await waitForEvent(codex, (msg) => msg.type === "ContextCompacted");
     expect(compacted.type).toBe("ContextCompacted");
 
-    const warning = await waitForEvent(codex, (msg) => msg.type === "Warning");
-    expect(warning.type).toBe("Warning");
-
-    await waitForEvent(codex, (msg) => msg.type === "TurnComplete");
+    // No "Heads up: Long threads…" Warning after the compaction (removed
+    // upstream in #55355).
+    const afterCompaction: EventMsg[] = [];
+    await waitForEvent(codex, (msg) => {
+      afterCompaction.push(msg);
+      return msg.type === "TurnComplete";
+    });
+    expect(afterCompaction.filter((msg) => msg.type === "Warning")).toEqual([]);
 
     // 4 fetches: round1, round2, compaction, round3
     expect(fetchMock).toHaveBeenCalledTimes(4);
@@ -310,6 +352,79 @@ describe("mid-turn auto-compaction", () => {
 
     // Only two fetches: no compaction
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ─── Integration: contextual user messages are not retained ────────────────────
+// CodexThreadConfig.isContextualUserMessage reaches the compaction: the host's
+// hidden per-turn messages are left to the summary instead of surviving it
+// verbatim and eating the 20k retained budget.
+
+describe("compaction with isContextualUserMessage", () => {
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  async function compactOnce(
+    isContextualUserMessage: ((text: string) => boolean) | undefined,
+  ) {
+    const fetchMock = vi.fn();
+    const usage = (inputTokens: number, items: object[]) =>
+      sseFlat([
+        ...items,
+        {
+          type: "response.completed",
+          response: {
+            id: "resp",
+            status: "completed",
+            usage: { input_tokens: inputTokens, output_tokens: 10, total_tokens: inputTokens + 10 },
+          },
+        },
+      ]);
+    fetchMock
+      .mockResolvedValueOnce(
+        makeSseResponse(usage(1000, [evResponseCreated("r1"), evFunctionCall("c1", "get_goal", {})])),
+      )
+      .mockResolvedValueOnce(
+        makeSseResponse(usage(2000, [evResponseCreated("r2"), evFunctionCall("c2", "get_goal", {})])),
+      )
+      .mockResolvedValueOnce(
+        makeSseResponse(
+          sseFlat([evResponseCreated("s"), evAssistantMessage("summary text"), evCompleted("s")]),
+        ),
+      )
+      .mockResolvedValueOnce(
+        makeSseResponse(sseFlat([evResponseCreated("r3"), evAssistantMessage("done"), evCompleted("r3")])),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const codex = new CodexThread({
+      apiKey: "test",
+      model: "gpt-4o",
+      autoCompactTokenLimit: 900,
+      isContextualUserMessage,
+    });
+    await codex.submit({
+      type: "UserInput",
+      items: [{ type: "text", text: "real ask" }],
+      extraUserMessages: [[{ type: "text", text: "[SYSTEM] workspace event" }]],
+    });
+    await waitForEvent(codex, (msg) => msg.type === "TurnComplete");
+    return JSON.stringify(
+      (JSON.parse((fetchMock.mock.calls[3]![1] as RequestInit).body as string) as {
+        input: unknown[];
+      }).input,
+    );
+  }
+
+  it("drops the messages the predicate claims from the compacted history", async () => {
+    const after = await compactOnce((text) => text.startsWith("[SYSTEM]"));
+    expect(after).toContain(SUMMARY_PREFIX.slice(0, 30));
+    expect(after).toContain("real ask");
+    expect(after).not.toContain("[SYSTEM] workspace event");
+  });
+
+  it("retains them without a predicate", async () => {
+    expect(await compactOnce(undefined)).toContain("[SYSTEM] workspace event");
   });
 });
 
