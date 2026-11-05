@@ -103,6 +103,16 @@ export interface CustomTool {
    * read whole (documents, JSON it parses, ids it copies).
    */
   maxOutputBytes?: number | undefined;
+  /**
+   * Calls to this tool may run concurrently with other parallel-safe calls of
+   * the same round (mirrors ToolExecutor::supports_parallel_tool_calls, true
+   * for dynamic tools since #54654). Set it only for tools that are safe to
+   * overlap: read-only, no ordering-sensitive side effects, no shared mutable
+   * state. Absent/false → exclusive: the call waits for every earlier call of
+   * the round to settle, and later ones wait for it. Outputs reach the model
+   * in call order either way.
+   */
+  supportsParallel?: boolean | undefined;
 }
 
 const GOAL_TOOL_NAMES: ReadonlySet<string> = new Set([
@@ -144,15 +154,32 @@ export class ToolRouter {
    * one that shadows a custom tool of the same name (see dispatch).
    */
   maxOutputBytesFor(toolName: string): number | undefined {
-    const builtin =
-      toolName === REQUEST_USER_INPUT_TOOL_NAME ||
-      toolName === UPDATE_PLAN_TOOL_NAME ||
-      (this.enableGoalTools && GOAL_TOOL_NAMES.has(toolName));
-    if (builtin) return undefined;
+    if (this.isBuiltin(toolName)) return undefined;
     const maxBytes = this.customTools.get(toolName)?.maxOutputBytes;
     return typeof maxBytes === "number" && Number.isFinite(maxBytes) && maxBytes >= 0
       ? Math.floor(maxBytes)
       : undefined;
+  }
+
+  /**
+   * Whether a call to `toolName` may run alongside other parallel-safe calls:
+   * only a custom tool that opted in (CustomTool.supportsParallel). Built-ins
+   * (request_user_input, update_plan, goal tools) and unknown names are
+   * exclusive.
+   */
+  supportsParallel(toolName: string): boolean {
+    if (this.isBuiltin(toolName)) return false;
+    return this.customTools.get(toolName)?.supportsParallel === true;
+  }
+
+  /** A name that dispatches to a built-in — shadowing any custom tool of the
+   *  same name (see dispatch). */
+  private isBuiltin(toolName: string): boolean {
+    return (
+      toolName === REQUEST_USER_INPUT_TOOL_NAME ||
+      toolName === UPDATE_PLAN_TOOL_NAME ||
+      (this.enableGoalTools && GOAL_TOOL_NAMES.has(toolName))
+    );
   }
 
   /** All tool specs to include in Responses API requests */

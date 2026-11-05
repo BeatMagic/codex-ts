@@ -14,6 +14,7 @@ import type { EventMsg } from "../../../protocol/src/protocol.js";
 import type { UserInput } from "../../../protocol/src/user_input.js";
 import { toolSpecToRequestJson } from "../../../tools/src/tool_spec.js";
 import { ToolRouter } from "../tools/router.js";
+import type { ToolRouterContext } from "../tools/router.js";
 import {
   canonicalizeStoredArguments,
   parseToolArguments,
@@ -374,7 +375,7 @@ async function runCompactAndRecompute(
   }
 }
 
-// ─── Interrupted tool calls ──────────────────────────────────────────────────
+// ─── Tool calls ──────────────────────────────────────────────────────────────
 
 /**
  * The output of a call that was never started because the turn was
@@ -427,25 +428,61 @@ function untilAborted<T>(
 }
 
 /**
- * Record the outputs of an interrupted round's calls. Persistence is queued,
- * not awaited: TurnAborted must not wait on a host write, and the ordered
- * queue still lands these lines before anything a later turn appends.
+ * Run one call and settle with its output; never rejects. mirrors
+ * handle_tool_call (parallel.rs): the dispatch raced against the turn's abort
+ * ("aborted by user after Xs" when the abort wins), and a handler error turned
+ * into the call's output (failure_response — only a Fatal error ends the turn
+ * in rs). Ending the turn on a throw used to leave the call unpaired, so the
+ * model never learned what failed. An AbortError from the tool's OWN work
+ * (the turn not interrupted) is just another failure.
  */
-function recordInterruptedCalls(
+async function runToolCall(
+  router: ToolRouter,
+  call: { call_id: string; name: string },
+  args: unknown,
+  ctx: ToolRouterContext,
+  abortSignal: AbortSignal | undefined,
+): Promise<string | FunctionCallOutputContentItem[]> {
+  const startedAtMs = Date.now();
+  try {
+    return await untilAborted(
+      router.dispatch(call.name, call.call_id, args, ctx),
+      abortSignal,
+    );
+  } catch (err) {
+    if (abortSignal?.aborted) return abortedByUserOutput(startedAtMs);
+    console.warn(
+      `[codex] tool ${call.name} (${call.call_id}) threw; ` +
+        `returning the error to the model:`,
+      err,
+    );
+    return err instanceof Error && err.message ? err.message : String(err);
+  }
+}
+
+/**
+ * Record one call's output: the model-visible history gets the tool's output
+ * policy applied, the rollout the original (tools/output_truncation.ts). Once
+ * the turn is interrupted the write is queued, not awaited: TurnAborted must
+ * not wait on a host write, and the ordered queue still lands these lines
+ * before anything a later turn appends.
+ */
+async function recordToolOutput(
   history: HistoryItem[],
   liveThread: LiveThread | undefined,
-  outputs: { call_id: string; output: string }[],
-): void {
-  if (outputs.length === 0) return;
-  const items = outputs.map(
-    ({ call_id, output }): HistoryItem => ({
-      type: "function_call_output",
-      call_id,
-      output,
-    }),
-  );
-  history.push(...items);
-  void liveThread?.appendConversationItems(items);
+  callId: string,
+  output: string | FunctionCallOutputContentItem[],
+  maxOutputBytes: number | undefined,
+  abortSignal: AbortSignal | undefined,
+): Promise<void> {
+  const item: HistoryItem = {
+    type: "function_call_output",
+    call_id: callId,
+    output,
+  };
+  history.push(applyOutputPolicy(item, maxOutputBytes));
+  const write = liveThread?.appendConversationItems([item]);
+  if (!abortSignal?.aborted) await write;
 }
 
 // ─── runTurn ─────────────────────────────────────────────────────────────────
@@ -1158,28 +1195,50 @@ export async function runTurn(
     // Abort semantics (mirrors tools/parallel.rs handle_tool_call_with_source,
     // which select!s every dispatch against the turn's cancellation token, and
     // #51556 for host-provided tools): an interrupt ends the turn AT ONCE, even
-    // while a tool is still running. The running call gets rs's "aborted by
+    // while tools are still running. Every running call gets rs's "aborted by
     // user after Xs" output, every call of this round that never started gets
     // a not-executed one, and all of them are recorded and persisted before
     // the AbortError — so the thread, live or resumed, has every call paired.
-    // The tool sees the interrupt through ctx.signal; if it keeps running
+    // A tool sees the interrupt through ctx.signal; if it keeps running
     // anyway, its late result is DISCARDED: recording it would give the call a
     // second output → Anthropic 400 ("each tool_use must have a single
     // result") persisted into the thread
     // (openrouter-responses-errors/2026-07-18/a1cf9c62).
+    //
+    // Concurrency (mirrors the RwLock in parallel.rs, #54654 for host tools):
+    // calls to parallel-safe tools (CustomTool.supportsParallel) start at once
+    // and run alongside each other; any other call is exclusive — it starts
+    // only after every earlier call has settled, and no later call starts
+    // until it has. Outputs are recorded strictly in CALL order, whatever
+    // order they complete in (rs FuturesOrdered).
     const toolSignal = abortSignal ?? new AbortController().signal;
-    for (const [index, call] of functionCalls.entries()) {
-      if (abortSignal?.aborted) {
-        recordInterruptedCalls(
+    // Records outputs in call order, each as soon as it and every earlier one
+    // have settled. Settled outputs never reject (see runToolCall).
+    let recorded: Promise<void> = Promise.resolve();
+    const recordInOrder = (
+      call: { call_id: string; name: string },
+      settled: Promise<string | FunctionCallOutputContentItem[]>,
+    ): void => {
+      recorded = recorded.then(async () =>
+        recordToolOutput(
           history,
           liveThread,
-          functionCalls.slice(index).map((pending) => ({
-            call_id: pending.call_id,
-            output: NOT_EXECUTED_OUTPUT,
-          })),
-        );
-        throw new DOMException("Turn interrupted", "AbortError");
+          call.call_id,
+          await settled,
+          router.maxOutputBytesFor(call.name),
+          abortSignal,
+        ),
+      );
+    };
+    const interruptFrom = async (index: number): Promise<never> => {
+      for (const pending of functionCalls.slice(index)) {
+        recordInOrder(pending, Promise.resolve(NOT_EXECUTED_OUTPUT));
       }
+      await recorded;
+      throw new DOMException("Turn interrupted", "AbortError");
+    };
+    for (const [index, call] of functionCalls.entries()) {
+      if (abortSignal?.aborted) await interruptFrom(index);
       let args: unknown;
       try {
         // Strict parse runs FIRST inside parseToolArguments, so a well-formed
@@ -1196,67 +1255,39 @@ export async function runTurn(
         // → tools/parallel.rs:186-209 failure_response；MCP 同义 mcp_tool_call.rs:117-132）。
         // 该 call 已作为 function_call 入 history 且仍在 functionCalls，本轮不 break，
         // 外层 for(;;) 会再采样让模型看到错误 = rs 的 needs_follow_up。
+        // Nothing runs, but like any call that is not parallel-safe it is a
+        // barrier: no later call starts before every earlier one has settled.
         const message = err instanceof Error ? err.message : String(err);
-        const errorItem: HistoryItem = {
-          type: "function_call_output",
-          call_id: call.call_id,
-          output: `failed to parse function arguments: ${message}`,
-        };
-        history.push(errorItem);
-        await liveThread?.appendConversationItems([errorItem]);
+        recordInOrder(
+          call,
+          Promise.resolve(`failed to parse function arguments: ${message}`),
+        );
+        await recorded;
         continue;
       }
 
-      const startedAtMs = Date.now();
-      let output: string | FunctionCallOutputContentItem[];
-      try {
-        output = await untilAborted(
-          router.dispatch(call.name, call.call_id, args, {
-            turnId,
-            pendingInputs,
-            emitEvent,
-            signal: toolSignal,
-          }),
+      const run = (): Promise<string | FunctionCallOutputContentItem[]> =>
+        runToolCall(
+          router,
+          call,
+          args,
+          { turnId, pendingInputs, emitEvent, signal: toolSignal },
           abortSignal,
         );
-      } catch (err) {
-        if (abortSignal?.aborted) {
-          // Interrupted while this tool ran (see block comment).
-          recordInterruptedCalls(history, liveThread, [
-            { call_id: call.call_id, output: abortedByUserOutput(startedAtMs) },
-            ...functionCalls.slice(index + 1).map((pending) => ({
-              call_id: pending.call_id,
-              output: NOT_EXECUTED_OUTPUT,
-            })),
-          ]);
-          throw new DOMException("Turn interrupted", "AbortError");
-        }
-        // A throwing tool is the model's to handle, not the turn's: the error
-        // goes back as the call's output and the turn carries on (mirrors
-        // parallel.rs failure_response — only a Fatal error ends the turn).
-        // Ending the turn here used to leave the call unpaired, so the model
-        // never learned what failed. An AbortError from the tool's OWN fetch
-        // (turn not interrupted) is just another failure.
-        console.warn(
-          `[codex] tool ${call.name} (${call.call_id}) threw; ` +
-            `returning the error to the model:`,
-          err,
-        );
-        output = err instanceof Error && err.message ? err.message : String(err);
+      if (router.supportsParallel(call.name)) {
+        // Shared: starts now, alongside the parallel calls before it.
+        recordInOrder(call, run());
+        continue;
       }
-
-      // The model sees the output under its tool's policy; the rollout keeps
-      // the original (see tools/output_truncation.ts).
-      const outputItem: HistoryItem = {
-        type: "function_call_output",
-        call_id: call.call_id,
-        output,
-      };
-      history.push(
-        applyOutputPolicy(outputItem, router.maxOutputBytesFor(call.name)),
-      );
-      await liveThread?.appendConversationItems([outputItem]);
+      // Exclusive: wait for every earlier call, run alone.
+      await recorded;
+      if (abortSignal?.aborted) await interruptFrom(index);
+      recordInOrder(call, run());
+      await recorded;
     }
+    // Every output is recorded before the round ends (an interrupt that hit
+    // the last parallel calls is then caught at the top of the next round).
+    await recorded;
 
     // ── Auto-compaction check (mirrors post-sampling compact, turn.rs:417-455) ─
     // Only triggered mid-turn (more sampling rounds follow), matching

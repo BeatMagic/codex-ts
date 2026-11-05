@@ -253,6 +253,44 @@ describe("interrupt while a tool call is mid-dispatch", () => {
     expect(outputsFor(persisted, "call-2").map((o) => o.output)).toEqual([NOT_EXECUTED]);
   });
 
+  it("TurnAborted does not wait on the host's write of the aborted outputs", async () => {
+    let releaseWrite!: () => void;
+    const writeGate = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    class SlowOutputIo extends InMemoryIoBackend {
+      override async appendLine(threadId: string, line: string): Promise<void> {
+        if (line.includes('"type":"function_call_output"')) await writeGate;
+        await super.appendLine(threadId, line);
+      }
+    }
+    const slow = blockingTool("slow_tool");
+    const { fetchMock } = scriptedFetch([evFunctionCall("call-slow", "slow_tool", {})]);
+    vi.stubGlobal("fetch", fetchMock);
+    const io = new SlowOutputIo();
+    const codex = new CodexThread({
+      apiKey: "test",
+      model: "gpt-4o",
+      customTools: [slow.tool],
+      ioBackend: io,
+    });
+    await codex.submit({ type: "UserInput", items: [{ type: "text", text: "go" }] });
+    await slow.started;
+    await codex.submit({ type: "Interrupt" });
+
+    // Arrives while the write of the aborted output is still blocked.
+    await waitForEvent(codex, (m) => m.type === "TurnAborted");
+    expect(outputsFor(await persistedConversation(io, codex.id), "call-slow")).toEqual([]);
+
+    releaseWrite();
+    await vi.waitFor(async () =>
+      expect(
+        outputsFor(await persistedConversation(io, codex.id), "call-slow").map((o) => o.output),
+      ).toEqual([expect.stringMatching(ABORTED_AFTER)]),
+    );
+    slow.finish("late");
+  });
+
   it("reaches every in-flight turn, not just the newest", async () => {
     const first = blockingTool("first_tool");
     const second = blockingTool("second_tool");

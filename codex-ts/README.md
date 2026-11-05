@@ -105,6 +105,11 @@ image.
 - **Errors.** A tool that throws does not end the turn: the error message
   becomes the call's output and the model carries on (codex-rs
   `failure_response`).
+- **Parallel calls (opt-in).** `supportsParallel: true` lets a tool's calls
+  run alongside other parallel-safe calls of the same round; any other call
+  is exclusive — it waits for every earlier call and blocks later ones until it
+  settles (codex-rs's shared/exclusive lock). Outputs reach the model in call
+  order. Mark only tools that are read-only and safe to overlap.
 - **Output truncation (opt-in).** `maxOutputBytes` middle-truncates a tool's
   output to that many UTF-8 bytes of text (images are kept) before it enters
   the model's history, with a `…N chars truncated…` marker — the codex-rs
