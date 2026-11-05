@@ -166,15 +166,44 @@ export function estimateTokensAfterLastModelGeneratedItem(
   return estimateItemsTokenCount(items.slice(start));
 }
 
-/** Where the current total came from — decides whether locally appended items
- *  still have to be added on top of it (see getTotalTokenUsage). */
-type TotalSource = "server" | "estimated" | "full";
+/**
+ * The history position just after `coveredThrough` — or, with no usable
+ * boundary, the last-model-output approximation rs installs whenever it
+ * rewrites history (reset_last_usage_boundary, history.rs:1097).
+ */
+function uncoveredStart(
+  items: ConversationItem[],
+  coveredThrough: ConversationItem | null | undefined,
+): number | null {
+  if (coveredThrough === null) return 0;
+  if (coveredThrough === undefined) return null;
+  const index = items.lastIndexOf(coveredThrough);
+  return index < 0 ? null : index + 1;
+}
 
 export class SessionTokenState {
   /** Last known active-context size in tokens (server usage, estimate, or
    *  forced-full). null until the first sample/estimate. */
   private total: number | null = null;
-  private source: TotalSource | null = null;
+  /**
+   * The last HISTORY item `total` accounts for, by object identity — the
+   * covered-item boundary of #58404 (rs last_server_reported_usage_item_count,
+   * history.rs:536-543). An object reference rather than an index, so it
+   * survives in-place rewrites (normalizeHistory inserting placeholders) and
+   * concurrent appends. `null`: no history item is covered — everything counts,
+   * like rs's boundary 0 on a fresh history. `undefined`: the total was
+   * recorded without a boundary (a caller that predates it) — see
+   * getTotalTokenUsage for the fallback.
+   */
+  private coveredThrough: ConversationItem | null | undefined = null;
+  /**
+   * A server measurement also covers the response's own output — rs's
+   * max(last_model_output_item_count, input_item_count). rs has recorded the
+   * output by the time usage arrives; codex-ts records it only after the
+   * stream ends, so it lands right AFTER `coveredThrough`: the model-generated
+   * run there belongs to the measured response.
+   */
+  private coversFollowingModelOutput = false;
 
   /**
    * The raw last-known number, with no allowance for what has been appended
@@ -188,9 +217,8 @@ export class SessionTokenState {
 
   /**
    * Active context size for a budgeting decision: the last known total PLUS an
-   * estimate of everything appended to history after the most recent
-   * model-generated item.
-   * mirrors get_total_token_usage (history.rs:421 / session/mod.rs:1256).
+   * estimate of every history item that total does not cover yet.
+   * mirrors get_total_token_usage (history.rs:1146-1163, after #58404).
    *
    * Why the addition matters: a tool that returns 200 KB lands in history right
    * after the response that requested it, and the next request of the SAME turn
@@ -198,13 +226,22 @@ export class SessionTokenState {
    * total there says "unchanged since the last response" and sails into a
    * `prompt is too long` 400 that compaction should have prevented.
    *
-   * Deviation from rs, deliberate: rs adds the appended-items estimate
-   * unconditionally, including right after `recompute_token_usage` has just
-   * written a FULL-history estimate into the same field — double-counting the
-   * tail. codex-ts tracks provenance instead and only adds when the total came
-   * from the server, which is the case the rs comment itself describes ("these
-   * are local items … not reflected in last_token_usage.total_tokens"). An
-   * estimated total already covers them; a forced-full total is saturated.
+   * The covered-item boundary (#58404, commit 7a030b9769) replaces the
+   * provenance rule this used to apply (add a tail to a server total only).
+   * That rule had a blind spot: after an ESTIMATED total — a fresh or resumed
+   * thread, or right after a compaction — nothing appended later was counted
+   * until a server usage frame arrived, and a response without usable usage
+   * never brings one. With the boundary, anything appended after ANY kind of
+   * count is counted, and the region an estimate already covers never is.
+   *
+   * Fallback when the boundary is unusable — the total was recorded without
+   * one, or its item has since left history (a rewrite that did not recompute):
+   * count the items after the last model-generated item. That is rs's own
+   * approximation for rewritten history (reset_last_usage_boundary) and exactly
+   * what codex-ts 0.8.0 added to a server total. The alternatives are worse in
+   * opposite directions: counting the whole history adds the covered region a
+   * second time, which on a large thread trips a compaction nobody needed;
+   * counting nothing reopens the blind spot.
    *
    * rs also adds `get_non_last_reasoning_items_tokens()` when the server did
    * not account for reasoning. codex-ts's ConversationItem has no reasoning
@@ -213,10 +250,16 @@ export class SessionTokenState {
    */
   getTotalTokenUsage(items: ConversationItem[]): number {
     const last = this.total ?? 0;
-    if (this.source === "estimated" || this.source === "full") {
-      return last;
+    let start = uncoveredStart(items, this.coveredThrough);
+    if (start === null) {
+      return last + estimateTokensAfterLastModelGeneratedItem(items);
     }
-    return last + estimateTokensAfterLastModelGeneratedItem(items);
+    if (this.coversFollowingModelOutput) {
+      while (start < items.length && isModelGeneratedItem(items[start]!)) {
+        start += 1;
+      }
+    }
+    return last + estimateItemsTokenCount(items.slice(start));
   }
 
   /**
@@ -224,56 +267,92 @@ export class SessionTokenState {
    * mirrors record_token_usage_info → history.update_token_info: the session
    * total becomes the response's total_tokens (the active context as the
    * server measured it). Falls back to input+output when total is absent.
+   *
+   * `coveredThrough` is the last history item the request carried (null: it
+   * carried none); the response's own output, recorded right after it, is
+   * covered too (history.rs:1068-1094). Omitted → the boundary is unknown and
+   * getTotalTokenUsage uses its fallback — the 0.8.0 rule for a server total.
    */
   updateFromUsage(input: {
     inputTokens: number;
     outputTokens?: number | undefined;
     totalTokens?: number | undefined;
+    coveredThrough?: ConversationItem | null | undefined;
   }): void {
     const total =
       input.totalTokens ?? input.inputTokens + (input.outputTokens ?? 0);
     this.total = Math.max(0, total);
-    this.source = "server";
+    this.coveredThrough = input.coveredThrough;
+    this.coversFollowingModelOutput = input.coveredThrough !== undefined;
   }
 
   /**
    * Restore a total persisted by a previous run of this thread (resume).
    * mirrors seeding token_info from the last rollout TokenCount
-   * (session/mod.rs last_token_info_from_rollout). Treated as a server total:
-   * items appended after the last model output are added on top of it.
+   * (session/mod.rs last_token_info_from_rollout) into a history whose
+   * boundary rs resets to just after the last model-generated item
+   * (reset_last_usage_boundary, history.rs:1097-1106): the persisted number
+   * measured a request plus its output, and whatever the client appended after
+   * that output — tool results, a user message whose request never completed —
+   * is counted on top. With no model-generated item the whole history counts
+   * as covered, as in rs. Pass the resumed `history`; without it the same rule
+   * is applied lazily at read time.
    */
-  restore(tokens: number): void {
+  restore(tokens: number, history?: ConversationItem[]): void {
     this.total = Math.max(0, tokens);
-    this.source = "server";
+    this.coversFollowingModelOutput = false;
+    if (history === undefined) {
+      this.coveredThrough = undefined;
+      return;
+    }
+    let boundary: ConversationItem | null = history[history.length - 1] ?? null;
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+      const item = history[index]!;
+      if (isModelGeneratedItem(item)) {
+        boundary = item;
+        break;
+      }
+    }
+    this.coveredThrough = boundary;
   }
 
   /**
    * Seed/replace the total with a byte-based estimate — used before the first
    * server usage arrives and after compaction rewrites history.
-   * mirrors recompute_token_usage (session/mod.rs:3994).
+   * mirrors recompute_token_usage (session/mod.rs:3994), which installs the
+   * estimate with the boundary at the end of the history it measured
+   * (set_token_info_with_boundary(.., history.raw_items().len())). Pass that
+   * last item as `coveredThrough` (recomputeTokenUsage does); omitted → the
+   * getTotalTokenUsage fallback.
    */
-  setEstimated(tokens: number): void {
+  setEstimated(
+    tokens: number,
+    coveredThrough?: ConversationItem | null | undefined,
+  ): void {
     this.total = Math.max(0, tokens);
-    this.source = "estimated";
+    this.coveredThrough = coveredThrough;
+    this.coversFollowingModelOutput = false;
   }
 
   /**
    * Mark the context as FULL after a context-window-exceeded rejection, so the
    * next pre-sampling check is guaranteed to compact first.
    * mirrors set_total_tokens_full (session/mod.rs:4077) — a no-op when the
-   * host didn't configure a context window, exactly like the rs guard.
+   * host didn't configure a context window, exactly like the rs guard. The
+   * boundary is left where it was (rs's set_token_usage_full does not touch
+   * it): anything uncovered only adds to a total already at the window.
    */
   setFull(contextWindow: number | undefined): void {
     if (contextWindow !== undefined) {
       this.total = contextWindow;
-      this.source = "full";
     }
   }
 }
 
 /** Arguments to {@link recomputeTokenUsage}. */
 export interface RecomputeTokenUsageParams {
-  /** Everything the next request will carry — context items AND history. */
+  /** Everything the next request will carry — context items AND history,
+   *  history last: the final item becomes the covered-item boundary. */
   items: ConversationItem[];
   /** The instructions blob sent alongside them, if any. */
   instructions?: string | undefined;
@@ -315,7 +394,7 @@ export function recomputeTokenUsage(params: RecomputeTokenUsageParams): number {
   const estimated =
     estimateItemsTokenCount(items) + approxTokenCount(instructions ?? "");
   if (overwriteTotal) {
-    tokenState.setEstimated(estimated);
+    tokenState.setEstimated(estimated, items[items.length - 1] ?? null);
   }
   compactWindow?.setEstimatedPrefill(estimated);
   if (emitEvent) {

@@ -129,6 +129,23 @@ export interface TurnConfig {
    * messages rather than baked into the `instructions` field. Not persisted.
    */
   contextItems?: HistoryItem[] | undefined;
+  /**
+   * Build the inline-compaction request as an extension of the turn's
+   * sampling request — same tools, reasoning, instructions and input prefix,
+   * summarization prompt last — so it can read the main chain's prompt cache
+   * instead of re-writing the whole history cold (see runInlineAutoCompactTask).
+   * Default true; false sends the legacy body (history + prompt only).
+   */
+  compactionRequestParity?: boolean | undefined;
+  /**
+   * Recognizes host-injected user messages that are context, not something the
+   * user said (hidden workspace events, programmatic cues), from the message's
+   * flattened input_text. Compaction keeps such messages out of the retained
+   * user messages (mirrors parse_user_message → None for contextual content,
+   * event_mapping.rs:114-117), so they neither crowd real user text out of the
+   * 20k budget nor survive the compaction verbatim. Omit to keep every one.
+   */
+  isContextualUserMessage?: ((text: string) => boolean) | undefined;
 }
 
 // ─── Auto-compaction status + orchestration ──────────────────────────────────
@@ -226,6 +243,10 @@ function markContextFull(
  * The rewrite is checkpointed (mirrors replace_compacted_history persisting
  * Compacted in the same lock section as the in-memory swap): a resumed thread
  * starts from the compacted history instead of replaying every raw item.
+ *
+ * `request` is what the turn's sampling requests carry besides history (the
+ * tools array and this turn's skill injections), so the summarizer request
+ * can be built as their extension (TurnConfig.compactionRequestParity).
  */
 async function runCompactAndRecompute(
   history: ConversationItem[],
@@ -235,6 +256,10 @@ async function runCompactAndRecompute(
   emitEvent: (msg: EventMsg) => void,
   liveThread: LiveThread | undefined,
   abortSignal: AbortSignal | undefined,
+  request: {
+    tools: Record<string, unknown>[];
+    skillInjectionItems: HistoryItem[];
+  },
 ): Promise<void> {
   // The window's generation, read BEFORE the summarizer runs; see
   // AutoCompactWindow.currentCompactionEpoch for why a late compaction must not
@@ -244,6 +269,8 @@ async function runCompactAndRecompute(
   try {
     applied = await runInlineAutoCompactTask(history, {
       ...config,
+      tools: request.tools,
+      skillInjectionItems: request.skillInjectionItems,
       abortSignal,
       isStaleCompaction: () =>
         compactWindow.currentCompactionEpoch() !== epochAtEntry,
@@ -311,16 +338,7 @@ async function runCompactAndRecompute(
         `over (epoch ${epochAtEntry} → ${compactWindow.currentCompactionEpoch()}) ` +
         `while this summarizer was in flight; history was NOT rewritten`,
     );
-    return;
   }
-  emitEvent({
-    type: "Warning",
-    event: {
-      message:
-        "Heads up: Long threads and multiple compactions can cause the model to be less accurate. " +
-        "Start a new thread when possible to keep threads small and targeted.",
-    },
-  });
 }
 
 // ─── runTurn ─────────────────────────────────────────────────────────────────
@@ -351,13 +369,14 @@ export async function runTurn(
    *  merged into one message"). */
   extraUserMessages?: UserInput[][] | undefined,
 ): Promise<{ lastAgentMessage: string }> {
-  // Record one user message per submitted group, in order (mutates the shared
-  // history array). codex-rs records each queued UserInput submission as its OWN
-  // role:user item and never merges them; we mirror that by recording `userItems`
-  // (the primary message) followed by each `extraUserMessages` entry as a separate
-  // message. Content mapping mirrors ResponseInputItem::from(Vec<UserInput>)
-  // (protocol/src/models.rs:1735): text → input_text, image → input_image
-  // { image_url } (detail default), audio → input_audio { audio_url }.
+  // One user message per submitted group, in order. codex-rs records each
+  // queued UserInput submission as its OWN role:user item and never merges
+  // them; we mirror that by recording `userItems` (the primary message)
+  // followed by each `extraUserMessages` entry as a separate message — after
+  // the pre-sampling compaction below. Content mapping mirrors
+  // ResponseInputItem::from(Vec<UserInput>) (protocol/src/models.rs:1735):
+  // text → input_text, image → input_image { image_url } (detail default),
+  // audio → input_audio { audio_url }.
   const toUserContent = (items: UserInput[]): UserContentPart[] =>
     items
       .map((item): UserContentPart | null => {
@@ -377,10 +396,97 @@ export async function runTurn(
     .map(toUserContent)
     .filter((content) => content.length > 0)
     .map((content) => ({ type: "message", role: "user", content }));
-  history.push(...userMsgs);
-  if (userMsgs.length > 0) {
-    await liveThread?.appendConversationItems(userMsgs);
+  // Mutates the shared history array.
+  const recordUserMessages = async (): Promise<void> => {
+    history.push(...userMsgs);
+    if (userMsgs.length > 0) {
+      await liveThread?.appendConversationItems(userMsgs);
+    }
+  };
+
+  const tools = router.toolSpecs().map(toolSpecToRequestJson);
+  const maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES;
+  let lastAgentMessage = "";
+  let itemIdCounter = 0;
+
+  // ── Auto-compaction window tracker (mirrors AutoCompactWindow in codex-rs) ──
+  // Uses BodyAfterPrefix mode: only tokens added after the last compaction count
+  // toward the limit. mirrors AutoCompactTokenLimitScope::BodyAfterPrefix.
+  //
+  // Prefer the THREAD-OWNED window (config.compactWindow) so the baseline persists
+  // ACROSS turns — codex-rs keeps this in session state. A fresh window per turn
+  // would reset the baseline to the (already large) current size every turn, so
+  // cross-turn growth never reaches the limit and a long interactive thread
+  // silently grows past the model's context window → "prompt is too long". Fall
+  // back to a private window only when no shared one is supplied (one-shot/tests).
+  const compactWindow = config.compactWindow ?? new AutoCompactWindow();
+  // Session token accounting — same thread-owned pattern (mirrors session state).
+  const tokenState = config.tokenState ?? new SessionTokenState();
+
+  // ── Estimated baseline seed (mirrors set_estimated_prefill, mod.rs:1290) ────
+  // Until the first server usage arrives (fresh thread, resumed thread, or a
+  // freshly compacted window) the window baseline and session total start from
+  // a byte-based estimate of what this turn is about to send — its new user
+  // messages included, though they are recorded only after the pre-sampling
+  // compaction below. Server usage overrides both on the next sampled response.
+  if (compactWindow.snapshot().prefillInputTokens === null) {
+    recomputeTokenUsage({
+      items: [...(config.contextItems ?? []), ...history, ...userMsgs],
+      instructions: config.instructions,
+      tokenState,
+      compactWindow,
+      // Seed only: a session total that already exists (server usage carried
+      // over from an earlier window) must not be overwritten by an estimate.
+      // What is missing here is the window baseline, not the total.
+      overwriteTotal: tokenState.totalTokens === null,
+    });
   }
+
+  // ── Pre-sampling compaction (mirrors run_pre_sampling_compact, turn.rs:149) ─
+  // Compact BEFORE the first request of the turn when the context is already
+  // at/over budget — e.g. the previous turn ended with a context-window-exceeded
+  // rejection (which force-filled the session total), or a resumed thread's
+  // history estimate already exceeds the window. This is the self-heal path:
+  // without it, every subsequent request would keep failing with 400.
+  //
+  // It runs BEFORE this turn's input is recorded (mirrors turn.rs:221-266,
+  // commit ee93abb690 / #44487), so the summary covers the history up to the
+  // new ask and the ask follows it: [.., summary, <new message>]. The earlier
+  // port recorded first: the ask was summarized, re-collected as one more
+  // retained user message, and the model's latest instruction ended up BEFORE
+  // a handoff summary. The check still counts the new messages — the next
+  // request carries them (the estimate upstream leaves as a TODO at
+  // turn.rs:221-224).
+  {
+    const preStatus = autoCompactTokenStatus(
+      config,
+      compactWindow,
+      tokenState,
+      [...history, ...userMsgs],
+    );
+    if (preStatus.tokenLimitReached) {
+      try {
+        await runCompactAndRecompute(
+          history,
+          config,
+          compactWindow,
+          tokenState,
+          emitEvent,
+          liveThread,
+          abortSignal,
+          // No request of THIS turn has been sent yet, so its skill
+          // injections are in no prefix the summarizer could extend.
+          { tools, skillInjectionItems: [] },
+        );
+      } catch (err) {
+        // The input was accepted: a failed or interrupted compaction must not
+        // drop it (#44487 records it on every failure).
+        await recordUserMessages();
+        throw err;
+      }
+    }
+  }
+  await recordUserMessages();
 
   // ── Layer 2: turn-scoped skill full-body injection (mirrors codex-rs) ──────
   // A `$skill-name` mention in user input pulls that skill's full SKILL.md into
@@ -406,69 +512,6 @@ export async function runTurn(
           ],
         });
       }
-    }
-  }
-
-  const tools = router.toolSpecs().map(toolSpecToRequestJson);
-  const maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES;
-  let lastAgentMessage = "";
-  let itemIdCounter = 0;
-
-  // ── Auto-compaction window tracker (mirrors AutoCompactWindow in codex-rs) ──
-  // Uses BodyAfterPrefix mode: only tokens added after the last compaction count
-  // toward the limit. mirrors AutoCompactTokenLimitScope::BodyAfterPrefix.
-  //
-  // Prefer the THREAD-OWNED window (config.compactWindow) so the baseline persists
-  // ACROSS turns — codex-rs keeps this in session state. A fresh window per turn
-  // would reset the baseline to the (already large) current size every turn, so
-  // cross-turn growth never reaches the limit and a long interactive thread
-  // silently grows past the model's context window → "prompt is too long". Fall
-  // back to a private window only when no shared one is supplied (one-shot/tests).
-  const compactWindow = config.compactWindow ?? new AutoCompactWindow();
-  // Session token accounting — same thread-owned pattern (mirrors session state).
-  const tokenState = config.tokenState ?? new SessionTokenState();
-
-  // ── Estimated baseline seed (mirrors set_estimated_prefill, mod.rs:1290) ────
-  // Until the first server usage arrives (fresh thread, resumed thread, or a
-  // freshly compacted window) the window baseline and session total start from
-  // a byte-based estimate of what this turn is about to send. Server usage
-  // overrides both on the next sampled response.
-  if (compactWindow.snapshot().prefillInputTokens === null) {
-    recomputeTokenUsage({
-      items: [...(config.contextItems ?? []), ...history],
-      instructions: config.instructions,
-      tokenState,
-      compactWindow,
-      // Seed only: a session total that already exists (server usage carried
-      // over from an earlier window) must not be overwritten by an estimate.
-      // What is missing here is the window baseline, not the total.
-      overwriteTotal: tokenState.totalTokens === null,
-    });
-  }
-
-  // ── Pre-sampling compaction (mirrors run_pre_sampling_compact, turn.rs:149) ─
-  // Compact BEFORE the first request of the turn when the context is already
-  // at/over budget — e.g. the previous turn ended with a context-window-exceeded
-  // rejection (which force-filled the session total), or a resumed thread's
-  // history estimate already exceeds the window. This is the self-heal path:
-  // without it, every subsequent request would keep failing with 400.
-  {
-    const preStatus = autoCompactTokenStatus(
-      config,
-      compactWindow,
-      tokenState,
-      history,
-    );
-    if (preStatus.tokenLimitReached) {
-      await runCompactAndRecompute(
-        history,
-        config,
-        compactWindow,
-        tokenState,
-        emitEvent,
-        liveThread,
-        abortSignal,
-      );
     }
   }
 
@@ -521,6 +564,9 @@ export async function runTurn(
       stream: true,
     };
     if (config.instructions) body["instructions"] = config.instructions;
+    // The last history item this request carries: its usage covers history
+    // through here, plus the output recorded from it (updateFromUsage).
+    const sentThrough = history[history.length - 1] ?? null;
 
     // ── Sample from the model (retry transient failures) ────────────────────
     // mirrors codex-rs's stream retry loop (responses_retry.rs): a network
@@ -711,6 +757,7 @@ export async function runTurn(
                       typeof usage["total_tokens"] === "number"
                         ? usage["total_tokens"]
                         : undefined,
+                    coveredThrough: sentThrough,
                   });
                   compactWindow.ensureServerObservedPrefill(
                     inputTokensThisRound,
@@ -953,6 +1000,7 @@ export async function runTurn(
           emitEvent,
           liveThread,
           abortSignal,
+          { tools, skillInjectionItems },
         );
       }
     }

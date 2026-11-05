@@ -180,6 +180,29 @@ export interface CodexThreadConfig {
    * SUMMARIZATION_PROMPT ported from prompts/templates/compact/prompt.md.
    */
   compactPrompt?: string | undefined;
+  /**
+   * Send the inline-compaction request as an extension of the sampling
+   * request (same tools, reasoning, instructions and input prefix, prompt
+   * last), so it reads the main chain's prompt cache. Default true; false
+   * restores the legacy summarizer body (history + prompt, no tools).
+   */
+  compactionRequestParity?: boolean | undefined;
+  /**
+   * Recognizes host-injected user messages that are context rather than user
+   * speech (hidden workspace events, programmatic cues), given the message's
+   * flattened input_text. Compaction leaves them out of the retained user
+   * messages — they no longer eat the 20k budget or survive verbatim — and
+   * relies on the summary to carry them (mirrors upstream skipping contextual
+   * fragments). Omit to retain every user message.
+   */
+  isContextualUserMessage?: ((text: string) => boolean) | undefined;
+  /**
+   * Advertise the built-in goal tools (get_goal / create_goal / update_goal).
+   * Default true. false drops them from every request, and a call to one gets
+   * the same unknown-tool reply as any other unadvertised name. update_plan
+   * and request_user_input are not affected.
+   */
+  enableGoalTools?: boolean | undefined;
 }
 
 interface ResolvedConfig {
@@ -196,6 +219,8 @@ interface ResolvedConfig {
   contextWindow?: number | undefined;
   maxRetries?: number | undefined;
   compactPrompt?: string | undefined;
+  compactionRequestParity?: boolean | undefined;
+  isContextualUserMessage?: ((text: string) => boolean) | undefined;
 }
 
 // ─── CodexThread ─────────────────────────────────────────────────────────────
@@ -248,6 +273,8 @@ export class CodexThread {
       contextWindow: config.contextWindow,
       maxRetries: config.maxRetries,
       compactPrompt: config.compactPrompt,
+      compactionRequestParity: config.compactionRequestParity,
+      isContextualUserMessage: config.isContextualUserMessage,
     };
 
     this.threadId = config.threadId ?? nextId();
@@ -265,7 +292,9 @@ export class CodexThread {
     const goalStore = config.goalStore ?? new GoalStore(new InMemoryGoalBackend());
     this.goalExecutor = new GoalToolExecutor(this.threadId, goalStore);
 
-    this.router = new ToolRouter(this.goalExecutor, config.customTools);
+    this.router = new ToolRouter(this.goalExecutor, config.customTools, {
+      enableGoalTools: config.enableGoalTools ?? true,
+    });
   }
 
   /** The thread's stable identifier (use for resume) */
@@ -325,7 +354,7 @@ export class CodexThread {
       // server-grounded number — or a persisted forced-full mark — against the
       // window, instead of a fresh estimate that under-reads dense threads.
       if (state.lastTokenTotal !== null) {
-        thread.tokenState.restore(state.lastTokenTotal);
+        thread.tokenState.restore(state.lastTokenTotal, thread.history);
       }
     }
     return thread;
@@ -411,6 +440,12 @@ export class CodexThread {
             : {}),
           ...(this.config.compactPrompt !== undefined
             ? { compactPrompt: this.config.compactPrompt }
+            : {}),
+          ...(this.config.compactionRequestParity !== undefined
+            ? { compactionRequestParity: this.config.compactionRequestParity }
+            : {}),
+          ...(this.config.isContextualUserMessage
+            ? { isContextualUserMessage: this.config.isContextualUserMessage }
             : {}),
         };
 

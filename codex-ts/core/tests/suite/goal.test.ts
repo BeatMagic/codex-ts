@@ -6,6 +6,8 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { CodexThread } from "../../src/codex_thread.js";
 import { GoalToolExecutor } from "../../../ext/goal/src/tool.js";
+import { ToolRouter } from "../../src/tools/router.js";
+import type { CustomTool } from "../../src/tools/router.js";
 import type { EventMsg } from "../../../protocol/src/protocol.js";
 import {
   waitForEvent,
@@ -161,3 +163,105 @@ describe("create_goal tool call", () => {
   });
 });
 
+
+// ─── Goal tools are opt-out (CodexThreadConfig.enableGoalTools) ───────────────
+// rs registers them only when the goal extension is enabled
+// (ext/goal/src/extension.rs goals_enabled). A host that never sets goals
+// should not advertise three tool definitions on every request.
+
+describe("enableGoalTools: false", () => {
+  beforeEach(() => { vi.unstubAllGlobals(); });
+
+  const GOAL_TOOLS = ["get_goal", "create_goal", "update_goal"];
+
+  it("drops only the goal tools from the advertised specs", () => {
+    const names = (router: ToolRouter) => router.toolSpecs().map((spec) => spec.tool.name);
+    const enabled = names(new ToolRouter(new GoalToolExecutor("t")));
+    const disabled = names(
+      new ToolRouter(new GoalToolExecutor("t"), [], { enableGoalTools: false }),
+    );
+    expect(enabled).toEqual(expect.arrayContaining(GOAL_TOOLS));
+    expect(disabled).toEqual(enabled.filter((name) => !GOAL_TOOLS.includes(name)));
+    expect(disabled).toEqual(expect.arrayContaining(["request_user_input", "update_plan"]));
+  });
+
+  it("answers a goal-tool call with the unknown-tool roster", async () => {
+    const router = new ToolRouter(new GoalToolExecutor("t"), [], {
+      enableGoalTools: false,
+    });
+    const emitEvent = vi.fn();
+    const out = JSON.parse(
+      await router.dispatch("create_goal", "call-1", { objective: "x" }, {
+        turnId: "t",
+        pendingInputs: new Map(),
+        emitEvent,
+      }),
+    ) as { error: string; known_tools: string[] };
+    expect(out.error).toBe("Unknown tool: create_goal");
+    expect(out.known_tools).toEqual(router.toolSpecs().map((spec) => spec.tool.name));
+    expect(emitEvent).not.toHaveBeenCalled();
+  });
+
+  it("a host tool may take a goal tool's name once the built-in is off", async () => {
+    const custom: CustomTool = {
+      name: "get_goal",
+      spec: () => ({
+        type: "function",
+        tool: {
+          name: "get_goal",
+          description: "host goal",
+          parameters: { type: "object", properties: {}, additionalProperties: false },
+          strict: false,
+        },
+      }),
+      execute: async () => "host answer",
+    };
+    const router = new ToolRouter(new GoalToolExecutor("t"), [custom], {
+      enableGoalTools: false,
+    });
+    const out = await router.dispatch("get_goal", "call-1", {}, {
+      turnId: "t",
+      pendingInputs: new Map(),
+      emitEvent: () => undefined,
+    });
+    expect(out).toBe("host answer");
+  });
+
+  it("CodexThread wires it through to the request and to dispatch", async () => {
+    const fetchMock = vi.fn();
+    fetchMock.mockResolvedValueOnce(
+      makeSseResponse(
+        sseFlat([
+          evResponseCreated("r1"),
+          evFunctionCall("call-1", "get_goal", {}),
+          evCompleted("r1"),
+        ]),
+      ),
+    );
+    fetchMock.mockResolvedValueOnce(
+      makeSseResponse(
+        sseFlat([evResponseCreated("r2"), evAssistantMessage("ok"), evCompleted("r2")]),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const codex = new CodexThread({
+      apiKey: "test",
+      model: "gpt-4o",
+      enableGoalTools: false,
+    });
+    await codex.submit({ type: "UserInput", items: [{ type: "text", text: "go" }] });
+    await waitForEvent(codex, (msg) => msg.type === "TurnComplete");
+
+    const body = (index: number) =>
+      JSON.parse((fetchMock.mock.calls[index]![1] as RequestInit).body as string) as {
+        tools: { name: string }[];
+        input: { type: string; output?: string }[];
+      };
+    const advertised = body(0).tools.map((tool) => tool.name);
+    for (const name of GOAL_TOOLS) expect(advertised).not.toContain(name);
+    expect(advertised).toEqual(expect.arrayContaining(["request_user_input", "update_plan"]));
+    const output = body(1).input.find((item) => item.type === "function_call_output");
+    expect(output?.output).toContain("Unknown tool: get_goal");
+  });
+});

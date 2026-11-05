@@ -48,5 +48,6 @@ export type {
   CustomTool,
   CustomToolContext,
   ToolRouterContext,
+  ToolRouterOptions,
 } from "./tools/router.js";
 export { GoalToolExecutor } from "../../ext/goal/src/tool.js";

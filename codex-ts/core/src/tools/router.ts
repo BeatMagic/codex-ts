@@ -74,22 +74,45 @@ export interface CustomTool {
   execute(args: unknown, ctx: CustomToolContext): Promise<string>;
 }
 
+const GOAL_TOOL_NAMES: ReadonlySet<string> = new Set([
+  GET_GOAL_TOOL_NAME,
+  CREATE_GOAL_TOOL_NAME,
+  UPDATE_GOAL_TOOL_NAME,
+]);
+
+/** Built-in tool switches. */
+export interface ToolRouterOptions {
+  /**
+   * Advertise and dispatch the goal tools. Default true. rs only registers
+   * them when the goal extension is enabled (ext/goal/src/extension.rs
+   * `goals_enabled`); a host that never sets goals should not pay for three
+   * tool definitions on every request.
+   */
+  enableGoalTools?: boolean | undefined;
+}
+
 /** mirrors ToolRouter in router.rs */
 export class ToolRouter {
   private readonly goalExecutor: GoalToolExecutor;
   private readonly customTools: Map<string, CustomTool>;
+  private readonly enableGoalTools: boolean;
 
-  constructor(goalExecutor: GoalToolExecutor, customTools: CustomTool[] = []) {
+  constructor(
+    goalExecutor: GoalToolExecutor,
+    customTools: CustomTool[] = [],
+    options: ToolRouterOptions = {},
+  ) {
     this.goalExecutor = goalExecutor;
     this.customTools = new Map(customTools.map((tool) => [tool.name, tool]));
+    this.enableGoalTools = options.enableGoalTools ?? true;
   }
 
   /** All tool specs to include in Responses API requests */
   toolSpecs(): ToolSpec[] {
     return [
-      createGetGoalTool(),
-      createCreateGoalTool(),
-      createUpdateGoalTool(),
+      ...(this.enableGoalTools
+        ? [createGetGoalTool(), createCreateGoalTool(), createUpdateGoalTool()]
+        : []),
       createRequestUserInputTool(),
       createUpdatePlanTool(),
       ...Array.from(this.customTools.values(), (tool) => tool.spec()),
@@ -110,8 +133,14 @@ export class ToolRouter {
     const args = (typeof rawArgs === "object" && rawArgs !== null
       ? rawArgs
       : {}) as Record<string, unknown>;
+    // Disabled goal tools are not advertised, so their names are ordinary
+    // names: a call falls to the default arm like any other.
+    const builtinName =
+      this.enableGoalTools || !GOAL_TOOL_NAMES.has(toolName)
+        ? toolName
+        : undefined;
 
-    switch (toolName) {
+    switch (builtinName) {
       case GET_GOAL_TOOL_NAME: {
         const { output } = await this.goalExecutor.get();
         return output;

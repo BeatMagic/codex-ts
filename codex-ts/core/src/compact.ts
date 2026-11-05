@@ -91,21 +91,28 @@ export function isSummaryMessage(message: string): boolean {
  * first summary as a "user message" and stack summaries on top of each other.
  * Note the summary produced by THIS compaction is appended separately by
  * buildCompactedHistory.
+ *
+ * `isContextual` drops host-injected context the same way (rs's
+ * parse_user_message returns None for contextual fragments,
+ * event_mapping.rs:114-117); it sees the flattened text collected here.
  */
-export function collectUserMessages(history: ConversationItem[]): string[] {
+export function collectUserMessages(
+  history: ConversationItem[],
+  isContextual?: ((text: string) => boolean) | undefined,
+): string[] {
   const messages: string[] = [];
+  const keep = (text: string): boolean =>
+    text !== "" && !isSummaryMessage(text) && !(isContextual?.(text) ?? false);
   for (const item of history) {
     if (!("role" in item) || item.role !== "user") continue;
     if (typeof item.content === "string") {
-      if (item.content && !isSummaryMessage(item.content)) {
-        messages.push(item.content);
-      }
+      if (keep(item.content)) messages.push(item.content);
     } else if (Array.isArray(item.content)) {
       const text = item.content
         .filter((p): p is { type: "input_text"; text: string } => p.type === "input_text")
         .map((p) => p.text)
         .join("\n");
-      if (text && !isSummaryMessage(text)) messages.push(text);
+      if (keep(text)) messages.push(text);
     }
   }
   return messages;
@@ -169,6 +176,22 @@ export function buildCompactedHistory(
  * Returns the raw summary text (without SUMMARY_PREFIX), or null when the
  * compaction was dropped as STALE — in that case `history` is left exactly as it
  * was found. See `isStaleCompaction` below.
+ *
+ * Request shape. Given `tools` (and unless `compactionRequestParity` is false)
+ * the request EXTENDS the turn's sampling request: the same tools, reasoning
+ * and instructions, input = [contextItems, skillInjectionItems, history,
+ * prompt] — what the last sampling request sent, plus what was recorded since,
+ * plus the prompt. mirrors upstream's remote compaction
+ * (compact_remote_v2_attempt.rs:178-225, #44255). Anthropic renders tools →
+ * system → messages and caches by prefix, so the legacy body — no tools, no
+ * reasoning — could never read the main chain's cache: every compaction paid a
+ * full cold write of a 600–900k history that is replaced right after. No
+ * `tool_choice` is added (a tool_choice change invalidates Anthropic's
+ * messages cache), so the model may answer with a tool call instead of a
+ * summary; such an attempt — or one with no summary text — switches the rest
+ * of this compaction to the legacy body. The prompt is the LAST input item in
+ * both shapes, as `{type:"message", role:"user", content: <prompt string>}`:
+ * hosts recognize compaction requests by exactly that item.
  */
 export async function runInlineAutoCompactTask(
   history: ConversationItem[],
@@ -194,6 +217,12 @@ export async function runInlineAutoCompactTask(
     /** The turn's interrupt signal: aborts the summarizer request and any
      *  retry wait, and guarantees an interrupted compaction rewrites nothing. */
     abortSignal?: AbortSignal | undefined;
+    /** The `tools` array (request JSON) the turn's sampling requests carry.
+     *  Absent → the legacy request shape (see above). */
+    tools?: Record<string, unknown>[] | undefined;
+    /** The turn's `$skill` injection items, which its sampling requests
+     *  carry between contextItems and history. Parity shape only. */
+    skillInjectionItems?: ConversationItem[] | undefined;
   },
 ): Promise<string | null> {
   // Working copy sent to the summarizer. When the compaction request ITSELF
@@ -227,20 +256,40 @@ export async function runInlineAutoCompactTask(
   // mirrors run_inline_auto_compact_task (compact.rs:118): the host may override
   // the summarization prompt (`config.compact_prompt`), else the bundled one.
   const compactPrompt = config.compactPrompt ?? SUMMARIZATION_PROMPT;
+  // The sampling request's shape (see the doc comment). Cleared for the rest
+  // of this compaction once an attempt calls a tool or produces no summary.
+  let parity =
+    config.compactionRequestParity !== false && config.tools !== undefined;
+  // What the sampling request sends ahead of history. Outside
+  // `summarizerInput`, so the context-window trim below only drops history.
+  const requestPrefix: ConversationItem[] = [
+    ...(config.contextItems ?? []),
+    ...(config.skillInjectionItems ?? []),
+  ];
 
   for (;;) {
     throwIfAborted();
     // Build the compaction request: history + the summarization prompt at the end
     const compactInput: ConversationItem[] = [
+      ...(parity ? requestPrefix : []),
       ...summarizerInput,
       { type: "message", role: "user", content: compactPrompt },
     ];
 
-    const body: Record<string, unknown> = {
-      model: config.model,
-      input: compactInput,
-      stream: true,
-    };
+    // Keys in the sampling body's order (session/turn.ts).
+    const body: Record<string, unknown> = parity
+      ? {
+          model: config.model,
+          reasoning: { effort: config.reasoningEffort ?? "medium" },
+          input: compactInput,
+          tools: config.tools,
+          stream: true,
+        }
+      : {
+          model: config.model,
+          input: compactInput,
+          stream: true,
+        };
     if (config.instructions) body["instructions"] = config.instructions;
 
     try {
@@ -266,9 +315,16 @@ export async function runInlineAutoCompactTask(
       // Collect the assistant's summary text from the stream
       summaryText = "";
       let sawCompleted = false;
+      let sawToolCall = false;
       for await (const raw of parseSseStream(res.body)) {
         if (raw["type"] === "response.output_text.delta") {
           summaryText += String(raw["delta"] ?? "");
+        } else if (
+          raw["type"] === "response.output_item.added" ||
+          raw["type"] === "response.output_item.done"
+        ) {
+          const item = raw["item"] as Record<string, unknown> | undefined;
+          if (item?.["type"] === "function_call") sawToolCall = true;
         } else if (raw["type"] === "response.completed") {
           // First terminal event wins: anything after it is transport noise
           // (same rule as the turn loop's terminal_first_wins).
@@ -283,6 +339,22 @@ export async function runInlineAutoCompactTask(
           // otherwise retryable). mirrors process_responses_event.
           throw classifyStreamFailure(raw);
         }
+      }
+      // With tools advertised the model may call one instead of summarizing,
+      // or answer with no text. Neither is transient — the same body asks the
+      // same question — so retry at once with the legacy body, which has no
+      // tools to call. One switch per compaction; it costs no retry budget.
+      if (
+        parity &&
+        (sawToolCall || (sawCompleted && summaryText.trim() === ""))
+      ) {
+        parity = false;
+        console.warn(
+          `[codex] compaction request with the sampling request's tools ` +
+            `returned ${sawToolCall ? "a tool call" : "no summary text"}; ` +
+            `retrying this compaction without tools`,
+        );
+        continue;
       }
       // A summary is only a summary once the response COMPLETED: a stream that
       // just ends is cut off, and applying it would replace the history with
@@ -376,7 +448,10 @@ export async function runInlineAutoCompactTask(
   const newer = history.filter((item) => !summarized.has(item));
 
   // Collect recent user messages from the summarized part only
-  const userMessages = collectUserMessages(covered);
+  const userMessages = collectUserMessages(
+    covered,
+    config.isContextualUserMessage,
+  );
 
   // Build replacement history and mutate in place: summary first, then the
   // newer items (mirrors compact_pending_input::insert_summary). Pairing is

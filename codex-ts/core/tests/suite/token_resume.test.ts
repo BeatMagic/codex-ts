@@ -23,6 +23,7 @@ import {
   approxTokenCount,
   estimateItemTokenCount,
   SessionTokenState,
+  totalOnlyTokenCountEvent,
   utf8ByteLength,
 } from "../../src/state/token_state.js";
 import { InMemoryIoBackend } from "../../../thread-store/src/io_backend.js";
@@ -277,6 +278,88 @@ describe("resume seeding", () => {
     await resumed.submit({ type: "UserInput", items: [{ type: "text", text: "again" }] });
     await waitForEvent(resumed, (msg) => msg.type === "TurnComplete");
     expect(isSummarizerBody(fetchMock.mock.calls[0]![1] as RequestInit)).toBe(true);
+  });
+
+  // The persisted number measured a request and its output; a tool result the
+  // client appended after that output (the next request never completed) is
+  // counted on top — rs's reset_last_usage_boundary on resume, and what 0.8.0
+  // did for a restored total. Covering the WHOLE resumed history instead would
+  // send this thread to the provider ~10k tokens over its window.
+  it("a tool output persisted after the last measured response still counts on resume", async () => {
+    const io = new InMemoryIoBackend();
+    const threadId = "resume-tail";
+    const live = new LiveThread(threadId, new LocalThreadStore(io));
+    void live.appendConversationItems([
+      { type: "message", role: "user", content: [{ type: "input_text", text: "read it" }] },
+    ]);
+    void live.appendEvent(totalOnlyTokenCountEvent(500, 8_000));
+    void live.appendConversationItems([
+      { type: "function_call", call_id: "c1", name: "read_file", arguments: "{}" },
+      { type: "function_call_output", call_id: "c1", output: "x".repeat(40_000) },
+    ]);
+    await live.flush();
+
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(summaryResponse())
+      .mockResolvedValueOnce(
+        makeSseResponse(sseWithUsage(200, [evResponseCreated("r"), evAssistantMessage("ok")])),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const resumed = await CodexThread.create({
+      apiKey: "t",
+      model: "m",
+      contextWindow: 8_000,
+      threadId,
+      ioBackend: io,
+    });
+    await resumed.submit({ type: "UserInput", items: [{ type: "text", text: "next" }] });
+    await waitForEvent(resumed, (msg) => msg.type === "TurnComplete");
+    expect(isSummarizerBody(fetchMock.mock.calls[0]![1] as RequestInit)).toBe(true);
+  });
+
+  // The boundary is fixed at resume time, so the output of a later response
+  // that reports no usage still counts. (Re-deriving "after the last model
+  // output" on every read would slide past that output and hide it.)
+  it("after resume, a usage-less response's output counts toward the window", async () => {
+    const io = new InMemoryIoBackend();
+    const threadId = "resume-no-usage";
+    const live = new LiveThread(threadId, new LocalThreadStore(io));
+    void live.appendConversationItems([
+      { type: "message", role: "user", content: [{ type: "input_text", text: "old" }] },
+      { type: "message", role: "assistant", content: "old reply" },
+    ]);
+    void live.appendEvent(totalOnlyTokenCountEvent(100, 8_000));
+    await live.flush();
+
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        makeSseResponse(
+          sseFlat([
+            evResponseCreated("r1"),
+            evAssistantMessage("x".repeat(40_000)),
+            evFunctionCall("c1", "update_plan", { plan: [{ step: "s", status: "pending" }] }),
+            evCompleted("r1"),
+          ]),
+        ),
+      )
+      .mockResolvedValueOnce(summaryResponse())
+      .mockResolvedValueOnce(
+        makeSseResponse(sseWithUsage(200, [evResponseCreated("r2"), evAssistantMessage("ok")])),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const resumed = await CodexThread.create({
+      apiKey: "t",
+      model: "m",
+      contextWindow: 8_000,
+      threadId,
+      ioBackend: io,
+    });
+    await resumed.submit({ type: "UserInput", items: [{ type: "text", text: "go" }] });
+    await waitForEvent(resumed, (msg) => msg.type === "TurnComplete");
+    expect(isSummarizerBody(fetchMock.mock.calls[0]![1] as RequestInit)).toBe(false);
+    expect(isSummarizerBody(fetchMock.mock.calls[1]![1] as RequestInit)).toBe(true);
   });
 
   it("a small persisted total does not compact on resume", async () => {
