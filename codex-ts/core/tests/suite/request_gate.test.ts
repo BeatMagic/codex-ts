@@ -12,12 +12,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CodexThread } from "../../src/codex_thread.js";
-import { runInlineAutoCompactTask } from "../../src/compact.js";
+import { runInlineAutoCompactTask, SUMMARIZATION_PROMPT } from "../../src/compact.js";
 import { RequestGate } from "../../src/session/request_gate.js";
 import { runTurn } from "../../src/session/turn.js";
 import { ToolRouter } from "../../src/tools/router.js";
 import type { CustomTool } from "../../src/tools/router.js";
 import { GoalToolExecutor } from "../../../ext/goal/src/tool.js";
+import { InMemoryIoBackend } from "../../../thread-store/src/io_backend.js";
+import { LocalThreadStore } from "../../../thread-store/src/local_thread_store.js";
 import type { ConversationItem } from "../../../thread-store/src/types.js";
 import {
   evAssistantMessage,
@@ -276,5 +278,96 @@ describe("a request waiting for the gate", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
     // Released after the summary, whatever happens next.
     (await gate.acquire())();
+  });
+});
+
+// Two turns that both decided to compact queue on the gate. By the time the
+// second holds it the first has compacted, so the second must drop out BEFORE
+// sending — not pay a full summarizer request only to be dropped as stale.
+describe("compactions queued on the gate", () => {
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const summary = () =>
+    makeSseResponse(
+      sseFlat([evResponseCreated("s"), evAssistantMessage("SUM"), evCompleted("s")]),
+    );
+
+  it("the second, now stale, sends no summarizer request", async () => {
+    const gate = new RequestGate();
+    const history: ConversationItem[] = [
+      { type: "message", role: "user", content: "a" },
+      { type: "message", role: "assistant", content: "b" },
+    ];
+    const fetch = vi.fn(async () => summary());
+    // The shape runCompactAndRecompute gives the hook: the generation read
+    // on entry, bumped when a replacement lands.
+    let epoch = 0;
+    const compact = () => {
+      const atEntry = epoch;
+      return runInlineAutoCompactTask(history, {
+        apiKey: "k",
+        baseUrl: "http://x",
+        model: "m",
+        fetch,
+        requestGate: gate,
+        isStaleCompaction: () => epoch !== atEntry,
+        onHistoryReplaced: () => {
+          epoch += 1;
+        },
+      });
+    };
+
+    const results = await Promise.all([compact(), compact()]);
+    expect(results).toEqual(["SUM", null]);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("two turns that both start over the window send one summarizer request", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    // A resumed thread whose history alone is past its 1 000-token window:
+    // every turn's pre-sampling check trips.
+    const io = new InMemoryIoBackend();
+    await new LocalThreadStore(io).appendItems({
+      threadId: "big",
+      items: [
+        { kind: "ConversationItem", item: { type: "message", role: "user", content: "x".repeat(8_000) } },
+        { kind: "ConversationItem", item: { type: "message", role: "assistant", content: "ok" } },
+      ],
+    });
+    const bodies: { input: unknown[] }[] = [];
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(init.body as string) as { input: unknown[] };
+      bodies.push(body);
+      const summarizer = JSON.stringify(body.input[body.input.length - 1]).includes(
+        SUMMARIZATION_PROMPT.slice(0, 30),
+      );
+      return summarizer
+        ? summary()
+        : makeSseResponse(
+            sseFlat([evResponseCreated("r"), evAssistantMessage("ok"), evCompleted("r")]),
+          );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const codex = await CodexThread.create({
+      apiKey: "test",
+      model: "m",
+      contextWindow: 1_000,
+      threadId: "big",
+      ioBackend: io,
+    });
+    await codex.submit({ type: "UserInput", items: [{ type: "text", text: "one" }] });
+    await codex.submit({ type: "UserInput", items: [{ type: "text", text: "two" }] });
+    await waitForEvent(codex, (m) => m.type === "TurnComplete");
+    await waitForEvent(codex, (m) => m.type === "TurnComplete");
+
+    const summarizerRequests = bodies.filter((body) =>
+      JSON.stringify(body.input[body.input.length - 1]).includes(SUMMARIZATION_PROMPT.slice(0, 30)),
+    );
+    expect(summarizerRequests).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    warn.mockRestore();
   });
 });

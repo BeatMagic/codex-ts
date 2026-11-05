@@ -102,13 +102,17 @@ describe("runInlineAutoCompactTask staleness guard", () => {
     expect(applied).toBe("SUMMARY TEXT");
   });
 
-  it("asks the hook only AFTER the summarizer round trip", async () => {
-    // The whole point of placing the check at the mutation: a compaction that
-    // lands while the request is in flight must still be caught.
+  it("asks the hook again AFTER the summarizer round trip", async () => {
+    // The whole point of placing the final check at the mutation: a
+    // compaction that lands while the request is in flight must still be
+    // caught. (The check before sending only spares a request that is stale
+    // already — see the request-gate tests.)
     const asked: string[] = [];
+    let landed = false;
     const config = summarizerConfig({
       fetch: vi.fn(async () => {
         asked.push("fetch");
+        landed = true; // another compaction lands mid-flight
         return makeSseResponse(
           sseFlat([
             evResponseCreated("s1"),
@@ -119,10 +123,24 @@ describe("runInlineAutoCompactTask staleness guard", () => {
       }),
       isStaleCompaction: () => {
         asked.push("check");
-        return true;
+        return landed;
       },
     });
-    await runInlineAutoCompactTask(historyWith(["one"]), config);
-    expect(asked).toEqual(["fetch", "check"]);
+    const applied = await runInlineAutoCompactTask(historyWith(["one"]), config);
+    expect(asked).toEqual(["check", "fetch", "check"]);
+    expect(applied).toBeNull();
+  });
+
+  it("a compaction that is stale before it sends sends nothing", async () => {
+    const fetch = vi.fn();
+    const history = historyWith(["one"]);
+    const snapshot = JSON.stringify(history);
+    const applied = await runInlineAutoCompactTask(
+      history,
+      summarizerConfig({ fetch, isStaleCompaction: () => true }),
+    );
+    expect(applied).toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(JSON.stringify(history)).toBe(snapshot);
   });
 });

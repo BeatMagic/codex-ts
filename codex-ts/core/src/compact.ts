@@ -206,9 +206,10 @@ export async function runInlineAutoCompactTask(
   history: ConversationItem[],
   config: TurnConfig & {
     /**
-     * Asked ONCE, immediately before this summary would rewrite `history`.
-     * Returning true means another compaction landed while this summarizer was
-     * in flight, so this summary describes a history that no longer exists.
+     * Asked immediately before this summary would rewrite `history`, and
+     * before each summarizer request once the request gate is held. Returning
+     * true means another compaction landed since this one began, so its
+     * summary would describe a history that no longer exists.
      * See AutoCompactWindow.currentCompactionEpoch for why that is reachable.
      * Absent = never stale, i.e. codex-rs behavior.
      */
@@ -307,6 +308,12 @@ export async function runInlineAutoCompactTask(
       abortSignal,
     );
     try {
+      // Two turns that both decided to compact queue on the gate, and by the
+      // time the second holds it the first may already have compacted. Drop
+      // the stale one BEFORE sending — otherwise it pays a full summarizer
+      // request over the already-compacted history only to be dropped by the
+      // final check below.
+      if (config.isStaleCompaction?.()) return null;
       const res = await (config.fetch ?? fetch)(`${config.baseUrl}/responses`, {
         method: "POST",
         headers: {
